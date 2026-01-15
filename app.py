@@ -7,18 +7,18 @@ import streamlit as st
 from pulp import LpProblem, LpMaximize, LpVariable, lpSum, LpBinary, PULP_CBC_CMD
 
 from nba_api.stats.static import players as nba_players
-from nba_api.stats.static import teams as nba_teams
 from nba_api.stats.endpoints import playergamelog
 
 # ==========================
 # CONFIG
 # ==========================
-SEASON = "2025-26"
+SEASON = "2025-26"          # fixed season like you wanted
 DEFAULT_LAST_N = 10
 
 DK_SALARY_CAP = 50000
 DK_SLOTS = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
 
+# We'll store 3PM internally as FG3M (safe column name)
 STAT_COLS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M"]
 
 st.set_page_config(page_title="DK NBA Optimizer", layout="wide")
@@ -105,59 +105,71 @@ def get_player_id(name: str) -> int:
     m = player_id_map()
     if key in m:
         return m[key]
-    # fallback: search
-    matches = nba_players.find_players_by_full_name(name)
-    if not matches:
-        raise ValueError(f"Player not found: {name}")
-    return int(matches[0]["id"])
 
-@st.cache_data(ttl=86400)
-def team_map():
-    return {t["abbreviation"].upper(): t for t in nba_teams.get_teams()}
+    matches = nba_players.find_players_by_full_name(name)
+    if matches:
+        return int(matches[0]["id"])
+
+    raise ValueError(f"Player not found: {name}")
 
 # ==========================
-# NBA data
+# NBA data (FIXED: no silent failures)
 # ==========================
 @st.cache_data(ttl=3600)
-def gamelog(pid: int) -> pd.DataFrame:
+def gamelog(pid: int):
     """
-    Timeout + fallback so one bad player can't hang the app.
+    Returns (df, err_msg).
+    If NBA Stats fails / rate limits / times out, df is empty and err_msg explains why.
     """
     try:
-        df = playergamelog.PlayerGameLog(player_id=pid, season=SEASON, timeout=10).get_data_frames()[0]
-        return df if df is not None else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
+        df = playergamelog.PlayerGameLog(
+            player_id=pid,
+            season=SEASON,
+            timeout=20
+        ).get_data_frames()[0]
+
+        if df is None or df.empty:
+            return pd.DataFrame(), "EMPTY_RESPONSE"
+
+        return df, None
+
+    except Exception as e:
+        return pd.DataFrame(), f"{type(e).__name__}: {e}"
 
 def per_min_rates(gl: pd.DataFrame, n: int):
-    if gl is None or gl.empty:
-        return {c: 0.0 for c in STAT_COLS}, 0.0
-
     work = gl.head(n).copy()
+
+    # convert minutes safely
     work["MIN_float"] = work["MIN"].apply(parse_minutes)
     work = work.dropna(subset=["MIN_float"])
+
     if work.empty:
-        return {c: 0.0 for c in STAT_COLS}, 0.0
+        return None, None
 
     for c in STAT_COLS:
         work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0)
 
     tot_min = float(work["MIN_float"].sum())
     if tot_min <= 0:
-        return {c: 0.0 for c in STAT_COLS}, 0.0
+        return None, None
 
     rates = {c: float(work[c].sum()) / tot_min for c in STAT_COLS}
     avg_min = float(work["MIN_float"].mean())
     return rates, avg_min
 
 # ==========================
-# Projection (returns stats now)
+# Projection (FIXED: empty gamelog => ERR, not OK zeros)
 # ==========================
 def project_player(name: str, last_n: int):
     pid = get_player_id(name)
-    gl = gamelog(pid)
+    gl, err = gamelog(pid)
+
+    if gl is None or gl.empty:
+        raise RuntimeError(f"NO_GAMELOG ({err})")
 
     rates, mins = per_min_rates(gl, last_n)
+    if rates is None or mins is None or mins <= 0:
+        raise RuntimeError("NO_MINUTES_IN_SAMPLE")
 
     proj_stats = {c: round(float(rates[c] * mins), 2) for c in STAT_COLS}
     fp = dk_fp(proj_stats)
@@ -182,20 +194,17 @@ def read_dk_csv(file):
         "Team": df["TeamAbbrev"].astype(str).str.upper(),
         "GameInfo": df["Game Info"].astype(str),
     })
+
     out["Name_clean"] = out["Name"].apply(clean_name)
 
     # opponent abbrev from Game Info
-    away, home, opp = [], [], []
+    opp = []
     for gi, tm in zip(out["GameInfo"], out["Team"]):
         a, h = parse_game_info(gi)
-        away.append(a); home.append(h)
         if a and h:
             opp.append(h if tm == a else a)
         else:
             opp.append(None)
-
-    out["Away"] = away
-    out["Home"] = home
     out["Opp"] = opp
 
     return out
@@ -209,12 +218,20 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Projection settings")
-    last_n = st.number_input("Recent games window (N)", 1, 30, st.session_state.get("last_n", DEFAULT_LAST_N))
+    last_n = st.number_input(
+        "Recent games window (N)",
+        1, 30,
+        st.session_state.get("last_n", DEFAULT_LAST_N)
+    )
     st.session_state["last_n"] = int(last_n)
 
     st.divider()
     st.subheader("Late scratches")
-    out_text = st.text_area("Players OUT (one per line or comma-separated)", value=st.session_state.get("out_text", ""), height=130)
+    out_text = st.text_area(
+        "Players OUT (one per line or comma-separated)",
+        value=st.session_state.get("out_text", ""),
+        height=130
+    )
     st.session_state["out_text"] = out_text
 
     exclude_out = st.checkbox("Exclude OUT players from pool", value=st.session_state.get("exclude_out", True))
@@ -254,7 +271,6 @@ st.dataframe(
 # Build projections
 # ==========================
 st.subheader("Projections (Full Slate)")
-
 build_btn = st.button("Build/Refresh Projections")
 
 if "proj_df" not in st.session_state:
@@ -268,7 +284,7 @@ def build_projections(slate_df: pd.DataFrame) -> pd.DataFrame:
     for i, r in enumerate(slate_df.itertuples(index=False), start=1):
         prog.progress(int(i / max(total, 1) * 100), text=f"Running gamelog({r.Name}) ({i}/{total})...")
 
-        # if OUT and excluding, keep row with zeros so you can still see them
+        # OUT handling (show as 0s + OUT)
         if r.IsOutManual and st.session_state["exclude_out"]:
             rows.append({
                 "Name": r.Name,
@@ -276,7 +292,7 @@ def build_projections(slate_df: pd.DataFrame) -> pd.DataFrame:
                 "Positions": r.Positions,
                 "Salary": float(r.Salary) if pd.notna(r.Salary) else np.nan,
                 "Minutes": 0.0,
-                "PTS": 0.0, "REB": 0.0, "AST": 0.0, "3PM": 0.0, "STL": 0.0, "BLK": 0.0, "TOV": 0.0,
+                "PTS": 0.0, "REB": 0.0, "AST": 0.0, "FG3M": 0.0, "STL": 0.0, "BLK": 0.0, "TOV": 0.0,
                 "DK_FP": 0.0,
                 "Value": 0.0,
                 "Status": "OUT",
@@ -296,7 +312,7 @@ def build_projections(slate_df: pd.DataFrame) -> pd.DataFrame:
                 "PTS": stats["PTS"],
                 "REB": stats["REB"],
                 "AST": stats["AST"],
-                "3PM": stats["FG3M"],
+                "FG3M": stats["FG3M"],
                 "STL": stats["STL"],
                 "BLK": stats["BLK"],
                 "TOV": stats["TOV"],
@@ -304,18 +320,23 @@ def build_projections(slate_df: pd.DataFrame) -> pd.DataFrame:
                 "Value": value,
                 "Status": "OK" if not r.IsOutManual else "OUT (included)",
             })
-        except Exception:
+
+        except Exception as e:
+            # IMPORTANT: ERR rows are not faked as zeros anymore
             rows.append({
                 "Name": r.Name,
                 "Team": r.Team,
                 "Positions": r.Positions,
                 "Salary": float(r.Salary) if pd.notna(r.Salary) else np.nan,
                 "Minutes": np.nan,
-                "PTS": np.nan, "REB": np.nan, "AST": np.nan, "3PM": np.nan, "STL": np.nan, "BLK": np.nan, "TOV": np.nan,
+                "PTS": np.nan, "REB": np.nan, "AST": np.nan, "FG3M": np.nan, "STL": np.nan, "BLK": np.nan, "TOV": np.nan,
                 "DK_FP": np.nan,
                 "Value": np.nan,
-                "Status": "ERR",
+                "Status": f"ERR: {str(e)[:80]}",
             })
+
+        # tiny throttle to reduce rate limit risk
+        time.sleep(0.03)
 
     prog.empty()
     return pd.DataFrame(rows)
@@ -326,8 +347,11 @@ if build_btn or st.session_state["proj_df"] is None:
 proj_df = st.session_state["proj_df"].copy()
 proj_df = proj_df.sort_values("DK_FP", ascending=False)
 
+# Display-friendly column name "3PM"
+display_df = proj_df.rename(columns={"FG3M": "3PM"})
+
 st.dataframe(
-    proj_df[["Name","Team","Positions","Salary","Minutes","PTS","REB","AST","3PM","STL","BLK","TOV","DK_FP","Value","Status"]],
+    display_df[["Name","Team","Positions","Salary","Minutes","PTS","REB","AST","3PM","STL","BLK","TOV","DK_FP","Value","Status"]],
     use_container_width=True,
     hide_index=True
 )
@@ -336,6 +360,8 @@ st.dataframe(
 # Build optimizer pool
 # ==========================
 pool = proj_df.copy()
+
+# only rows with real projections
 pool = pool.dropna(subset=["Salary", "DK_FP"])
 pool = pool[pool["Salary"] > 0]
 pool = pool[pool["Status"].isin(["OK", "OUT (included)"])]
@@ -352,25 +378,25 @@ exclude_players = st.multiselect("Exclude players", options=pool_names, default=
 pool = pool[~pool["Name"].isin(exclude_players)].copy()
 
 # ==========================
-# Optimizer (FIXED)
+# Optimizer (FIXED: fills all 8 slots)
 # ==========================
 def optimize(pool_df: pd.DataFrame) -> pd.DataFrame:
     prob = LpProblem("DK_NBA_CLASSIC", LpMaximize)
 
-    rows = list(pool_df.itertuples(index=False))
+    rows = pool_df.to_dict("records")
     n = len(rows)
     if n == 0:
-        raise ValueError("Optimizer pool is empty. (Check OUT/exclude settings.)")
+        raise ValueError("Optimizer pool is empty. (Check OUT / ERR / exclude settings.)")
 
     # decision vars: x[i,slot]
     x = {}
-    for i, r in enumerate(rows):
+    for i in range(n):
         for slot in DK_SLOTS:
-            if slot_eligible(r.Positions, slot):
+            if slot_eligible(rows[i]["Positions"], slot):
                 x[(i, slot)] = LpVariable(f"x_{i}_{slot}", 0, 1, LpBinary)
 
     # objective
-    prob += lpSum(rows[i].DK_FP * x[(i, slot)] for (i, slot) in x)
+    prob += lpSum(rows[i]["DK_FP"] * x[(i, slot)] for (i, slot) in x)
 
     # each slot exactly once
     for slot in DK_SLOTS:
@@ -381,19 +407,19 @@ def optimize(pool_df: pd.DataFrame) -> pd.DataFrame:
         prob += lpSum(x[(i, slot)] for slot in DK_SLOTS if (i, slot) in x) <= 1, f"use_once_{i}"
 
     # salary cap
-    prob += lpSum(rows[i].Salary * x[(i, slot)] for (i, slot) in x) <= DK_SALARY_CAP, "salary_cap"
+    prob += lpSum(rows[i]["Salary"] * x[(i, slot)] for (i, slot) in x) <= DK_SALARY_CAP, "salary_cap"
 
     # max players per team
     max_team = int(st.session_state.get("max_team", 0))
     if max_team and max_team > 0:
-        teams_unique = sorted(set(r.Team for r in rows))
+        teams_unique = sorted(set(r["Team"] for r in rows))
         for t in teams_unique:
-            idxs = [i for i, r in enumerate(rows) if r.Team == t]
+            idxs = [i for i in range(n) if rows[i]["Team"] == t]
             prob += lpSum(x[(i, slot)] for i in idxs for slot in DK_SLOTS if (i, slot) in x) <= max_team, f"max_{t}"
 
     # locks
     for lp in lock_players:
-        idxs = [i for i, r in enumerate(rows) if r.Name == lp]
+        idxs = [i for i in range(n) if rows[i]["Name"] == lp]
         if idxs:
             i = idxs[0]
             prob += lpSum(x[(i, slot)] for slot in DK_SLOTS if (i, slot) in x) == 1, f"lock_{i}"
@@ -401,7 +427,8 @@ def optimize(pool_df: pd.DataFrame) -> pd.DataFrame:
     # solve
     prob.solve(PULP_CBC_CMD(msg=False))
 
-    lineup = []
+    # extract lineup
+    lineup_rows = []
     for slot in DK_SLOTS:
         chosen_i = None
         for i in range(n):
@@ -409,35 +436,31 @@ def optimize(pool_df: pd.DataFrame) -> pd.DataFrame:
                 chosen_i = i
                 break
         if chosen_i is None:
-            raise ValueError("No feasible lineup found. Try loosening constraints / locks.")
+            raise ValueError("No feasible lineup found. Loosen locks/max-team/exclusions.")
 
         r = rows[chosen_i]
-        lineup.append({
+        lineup_rows.append({
             "Slot": slot,
-            "Name": r.Name,
-            "Team": r.Team,
-            "Salary": int(r.Salary),
-            "Minutes": r.Minutes,
-            "PTS": r.PTS,
-            "REB": r.REB,
-            "AST": r.AST,
-            "3PM": r._8 if hasattr(r, "_8") else r.__getattribute__("3PM") if hasattr(r, "3PM") else r.__getattribute__("3PM") if False else r.PTS,  # safe fallback (not used)
-            "DK_FP": round(float(r.DK_FP), 2),
+            "Name": r["Name"],
+            "Team": r["Team"],
+            "PosEligible": "/".join(r["Positions"]),
+            "Salary": int(r["Salary"]),
+            "Minutes": r["Minutes"],
+            "PTS": r["PTS"],
+            "REB": r["REB"],
+            "AST": r["AST"],
+            "3PM": r["FG3M"],
+            "STL": r["STL"],
+            "BLK": r["BLK"],
+            "TOV": r["TOV"],
+            "DK_FP": round(float(r["DK_FP"]), 2),
+            "Value": r["Value"],
         })
 
-    lineup_df = pd.DataFrame(lineup)
-
-    # The "3PM" in itertuples can become an invalid attribute; replace from pool_df merge
-    lineup_df = lineup_df.merge(
-        pool_df[["Name", "3PM"]], on="Name", how="left", suffixes=("", "_fix")
-    )
-    lineup_df["3PM"] = lineup_df["3PM_fix"]
-    lineup_df = lineup_df.drop(columns=["3PM_fix"])
-
-    return lineup_df
+    return pd.DataFrame(lineup_rows)
 
 st.subheader("Optimizer")
-run_opt = st.button("Optimize Lineup")
+run_opt = st.button("Optimize Lineup (Classic)")
 
 if run_opt:
     try:
