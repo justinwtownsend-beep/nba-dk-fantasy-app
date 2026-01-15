@@ -36,8 +36,10 @@ OFF_BUMP_STRENGTH = 0.22
 OFF_BUMP_CAP = 1.25
 OFF_BUMP_TOP_N = 6
 
+HIDE_OUT_PLAYERS_FROM_TABLE = True
+
 st.set_page_config(page_title="DK NBA Optimizer", layout="wide")
-st.title("DraftKings NBA Optimizer (Cloud-Safe + OUT Bumps)")
+st.title("DraftKings NBA Optimizer (Cloud-safe + OUT bumps)")
 
 # ==========================
 # DK scoring
@@ -93,20 +95,23 @@ def get_player_id(name):
 # ==========================
 @st.cache_data(ttl=3600)
 def gamelog(pid):
+    last_err = None
     for i in range(GAMELOG_RETRIES):
         try:
             df = playergamelog.PlayerGameLog(
-                player_id=pid, season=SEASON, timeout=API_TIMEOUT_SECONDS
+                player_id=pid,
+                season=SEASON,
+                timeout=API_TIMEOUT_SECONDS
             ).get_data_frames()[0]
             if not df.empty:
                 return df
-        except Exception:
+        except Exception as e:
+            last_err = e
             time.sleep((1.6 ** i) + random.random())
-    return pd.DataFrame()
+    raise RuntimeError(f"NO_GAMELOG ({last_err})")
 
 def project_player(name, n):
     gl = gamelog(get_player_id(name))
-    if gl.empty: raise RuntimeError("NO_GAMELOG")
     gl["MIN_float"] = gl["MIN"].apply(parse_minutes)
     gl = gl.head(n)
     mins = gl["MIN_float"].mean()
@@ -127,30 +132,33 @@ def load_dk(file):
 # OUT bumps
 # ==========================
 def apply_out_bumps(df, out_set):
-    if not out_set: return df
-    df = df.copy()
+    if not out_set:
+        return df
 
+    df = df.copy()
     df["BaseMinutes"] = df["Minutes"]
+
     for c in STAT_COLS:
         df[f"PM_{c}"] = df[c] / df["Minutes"].replace(0, np.nan)
 
     for team in df[df["Name_clean"].isin(out_set)]["Team"].unique():
-        out_players = df[(df["Team"]==team) & (df["Name_clean"].isin(out_set))]
-        team_ok = df[(df["Team"]==team) & (~df["Name_clean"].isin(out_set))]
+        out_players = df[(df["Team"] == team) & (df["Name_clean"].isin(out_set))]
+        team_ok = df[(df["Team"] == team) & (~df["Name_clean"].isin(out_set))]
 
         missing_min = out_players["BaseMinutes"].sum()
-        if missing_min <= 0: continue
+        if missing_min <= 0:
+            continue
 
         weights = team_ok["BaseMinutes"].clip(lower=MIN_BENCH_FLOOR)
         weights /= weights.sum()
 
         for i in team_ok.index:
-            inc = min(weights.loc[i]*missing_min, MAX_MIN_INCREASE)
-            df.loc[i,"Minutes"] = min(df.loc[i,"Minutes"]+inc, MAX_MINUTES_PLAYER)
+            inc = min(weights.loc[i] * missing_min, MAX_MIN_INCREASE)
+            df.loc[i, "Minutes"] = min(df.loc[i, "Minutes"] + inc, MAX_MINUTES_PLAYER)
             for c in STAT_COLS:
-                df.loc[i,c] = df.loc[i,f"PM_{c}"] * df.loc[i,"Minutes"]
+                df.loc[i, c] = df.loc[i, f"PM_{c}"] * df.loc[i, "Minutes"]
 
-    df["DK_FP"] = df.apply(lambda r: dk_fp(r), axis=1)
+    df["DK_FP"] = df.apply(dk_fp, axis=1)
     df["Value"] = df["DK_FP"] / (df["Salary"] / 1000)
     return df
 
@@ -169,23 +177,34 @@ if not dk_file:
 slate = load_dk(dk_file)
 
 # ==========================
-# Build projections
+# Build projections (PROGRESS RESTORED)
 # ==========================
 rows = []
-for _, r in slate.iterrows():
+total = len(slate)
+progress = st.progress(0, text="Starting projections...")
+
+for i, r in enumerate(slate.itertuples(index=False), start=1):
+    progress.progress(
+        int(i / total * 100),
+        text=f"Running gamelog({r.Name}) ({i}/{total})"
+    )
+
     try:
         mins, stats = project_player(r.Name, last_n)
         row = {
-            **r,
+            **r._asdict(),
             "Minutes": mins,
             **stats,
         }
         row["DK_FP"] = dk_fp(row)
-        row["Value"] = row["DK_FP"] / (r.Salary/1000)
+        row["Value"] = row["DK_FP"] / (r.Salary / 1000)
         rows.append(row)
     except Exception:
-        continue
+        pass
+
     time.sleep(BUILD_THROTTLE_SECONDS)
+
+progress.empty()
 
 proj_df = pd.DataFrame(rows)
 
@@ -196,7 +215,7 @@ proj_df = apply_out_bumps(proj_df, out_set)
 # DISPLAY (OUT hidden)
 # ==========================
 display_df = proj_df[~proj_df["Name_clean"].isin(out_set)].copy()
-display_df = display_df.rename(columns={"FG3M":"3PM"})
+display_df = display_df.rename(columns={"FG3M": "3PM"})
 
 st.subheader("Projections")
 st.dataframe(
@@ -215,28 +234,37 @@ st.dataframe(
 def optimize(pool):
     prob = LpProblem("DK", LpMaximize)
     x = {}
-    for i,r in pool.iterrows():
+
+    for i, r in pool.iterrows():
         for s in DK_SLOTS:
             if slot_eligible(r.Positions, s):
-                x[(i,s)] = LpVariable(f"x_{i}_{s}", 0, 1, LpBinary)
+                x[(i, s)] = LpVariable(f"x_{i}_{s}", 0, 1, LpBinary)
 
-    prob += lpSum(pool.loc[i,"DK_FP"] * x[(i,s)] for (i,s) in x)
+    prob += lpSum(pool.loc[i, "DK_FP"] * x[(i, s)] for (i, s) in x)
+
     for s in DK_SLOTS:
-        prob += lpSum(x[(i,s)] for i in pool.index if (i,s) in x) == 1
-    prob += lpSum(pool.loc[i,"Salary"] * x[(i,s)] for (i,s) in x) <= DK_SALARY_CAP
+        prob += lpSum(x[(i, s)] for i in pool.index if (i, s) in x) == 1
+
+    prob += lpSum(pool.loc[i, "Salary"] * x[(i, s)] for (i, s) in x) <= DK_SALARY_CAP
+
     for i in pool.index:
-        prob += lpSum(x[(i,s)] for s in DK_SLOTS if (i,s) in x) <= 1
+        prob += lpSum(x[(i, s)] for s in DK_SLOTS if (i, s) in x) <= 1
 
     prob.solve(PULP_CBC_CMD(msg=False))
 
     lineup = []
     for s in DK_SLOTS:
-        for (i,sl) in x:
-            if sl==s and x[(i,sl)].value()==1:
+        for (i, sl) in x:
+            if sl == s and x[(i, sl)].value() == 1:
                 lineup.append(pool.loc[i])
+
     return pd.DataFrame(lineup)
 
 if st.button("Optimize Lineup"):
     lineup = optimize(display_df)
     st.subheader("Optimized Lineup")
-    st.dataframe(lineup[["Name","Team","Salary","DK_FP"]], hide_index=True)
+    st.dataframe(
+        lineup[["Name","Team","Salary","DK_FP"]],
+        hide_index=True,
+        use_container_width=True
+    )
