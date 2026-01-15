@@ -1,28 +1,48 @@
 import re
 import time
+import random
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 from pulp import LpProblem, LpMaximize, LpVariable, lpSum, LpBinary, PULP_CBC_CMD
-
 from nba_api.stats.static import players as nba_players
 from nba_api.stats.endpoints import playergamelog
 
 # ==========================
 # CONFIG
 # ==========================
-SEASON = "2025-26"          # fixed season like you wanted
+SEASON = "2025-26"
 DEFAULT_LAST_N = 10
 
 DK_SALARY_CAP = 50000
 DK_SLOTS = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
 
-# We'll store 3PM internally as FG3M (safe column name)
+# Use FG3M internally (safe column), display as 3PM
 STAT_COLS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M"]
 
+# Streamlit Cloud stability
+API_TIMEOUT_SECONDS = 35
+GAMELOG_RETRIES = 4
+BUILD_THROTTLE_SECONDS = 0.15
+RETRY_THROTTLE_SECONDS = 0.20
+
+# OUT teammate bumps (minutes + offense)
+ENABLE_OUT_BUMPS = True
+
+# Minutes redistribution behavior
+MIN_REDIS_TOP_N = 8          # distribute minutes across top N weighted teammates
+MIN_BENCH_FLOOR = 6.0        # bench guys still get some weight
+MAX_MINUTES_PLAYER = 40.0    # cap projected minutes after bumps
+MAX_MIN_INCREASE = 22.0      # cap how many minutes a single player can gain from bumps
+
+# Offense bump behavior (PTS/AST/3PM per-minute boost)
+OFF_BUMP_STRENGTH = 0.22     # how aggressive the per-minute offense bump is
+OFF_BUMP_CAP = 1.25          # max multiplier to PTS/AST/FG3M per-minute
+OFF_BUMP_TOP_N = 6           # apply per-minute offense bump to top N recipients
+
 st.set_page_config(page_title="DK NBA Optimizer", layout="wide")
-st.title("DraftKings NBA Classic – Projections + Optimizer")
+st.title("DraftKings NBA Classic – Projections + Optimizer (Cloud-safe + OUT bumps)")
 
 # ==========================
 # DK scoring
@@ -92,6 +112,18 @@ def parse_game_info(s: str):
         return None, None
     return m.group(1), m.group(2)
 
+def safe_float(x, default=np.nan):
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (float, int, np.number)):
+            return float(x)
+        if isinstance(x, str) and x.strip() == "":
+            return default
+        return float(x)
+    except Exception:
+        return default
+
 # ==========================
 # NBA lookup caches
 # ==========================
@@ -113,33 +145,38 @@ def get_player_id(name: str) -> int:
     raise ValueError(f"Player not found: {name}")
 
 # ==========================
-# NBA data (FIXED: no silent failures)
+# NBA data (Cloud-safe: retries + backoff)
 # ==========================
 @st.cache_data(ttl=3600)
 def gamelog(pid: int):
     """
     Returns (df, err_msg).
-    If NBA Stats fails / rate limits / times out, df is empty and err_msg explains why.
+    Retries + backoff + jitter to survive Streamlit Cloud throttling/timeouts.
     """
-    try:
-        df = playergamelog.PlayerGameLog(
-            player_id=pid,
-            season=SEASON,
-            timeout=20
-        ).get_data_frames()[0]
+    last_err = None
 
-        if df is None or df.empty:
-            return pd.DataFrame(), "EMPTY_RESPONSE"
+    for attempt in range(1, GAMELOG_RETRIES + 1):
+        try:
+            df = playergamelog.PlayerGameLog(
+                player_id=pid,
+                season=SEASON,
+                timeout=API_TIMEOUT_SECONDS
+            ).get_data_frames()[0]
 
-        return df, None
+            if df is None or df.empty:
+                return pd.DataFrame(), "EMPTY_RESPONSE"
 
-    except Exception as e:
-        return pd.DataFrame(), f"{type(e).__name__}: {e}"
+            return df, None
+
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            sleep_s = (1.6 ** attempt) + random.uniform(0.3, 0.9)
+            time.sleep(sleep_s)
+
+    return pd.DataFrame(), f"FAILED_AFTER_RETRIES ({last_err})"
 
 def per_min_rates(gl: pd.DataFrame, n: int):
     work = gl.head(n).copy()
-
-    # convert minutes safely
     work["MIN_float"] = work["MIN"].apply(parse_minutes)
     work = work.dropna(subset=["MIN_float"])
 
@@ -158,7 +195,7 @@ def per_min_rates(gl: pd.DataFrame, n: int):
     return rates, avg_min
 
 # ==========================
-# Projection (FIXED: empty gamelog => ERR, not OK zeros)
+# Projection (empty/fail => ERR, not OK zeros)
 # ==========================
 def project_player(name: str, last_n: int):
     pid = get_player_id(name)
@@ -197,7 +234,6 @@ def read_dk_csv(file):
 
     out["Name_clean"] = out["Name"].apply(clean_name)
 
-    # opponent abbrev from Game Info
     opp = []
     for gi, tm in zip(out["GameInfo"], out["Team"]):
         a, h = parse_game_info(gi)
@@ -208,6 +244,190 @@ def read_dk_csv(file):
     out["Opp"] = opp
 
     return out
+
+# ==========================
+# OUT bumps (minutes + offense)
+# ==========================
+def _pos_overlap(a: list, b: list) -> bool:
+    return len(set(a or []) & set(b or [])) > 0
+
+def apply_out_bumps(proj_df: pd.DataFrame, slate_df: pd.DataFrame, out_clean_set: set) -> pd.DataFrame:
+    """
+    Applies two adjustments when players are manually OUT:
+    1) Minutes redistribution: missing minutes get redistributed (with extra weight to the "backup" position group)
+    2) Offense bump: a per-minute multiplier to PTS/AST/FG3M for key recipients (cap applied)
+
+    IMPORTANT: This uses only data we already have (no extra endpoints), so it stays Cloud-friendly.
+    """
+    if proj_df is None or proj_df.empty or not out_clean_set:
+        return proj_df
+
+    df = proj_df.copy()
+
+    # Ensure baseline columns exist (for transparency)
+    if "BaseMinutes" not in df.columns:
+        df["BaseMinutes"] = df["Minutes"]
+    if "BaseDK_FP" not in df.columns:
+        df["BaseDK_FP"] = df["DK_FP"]
+    if "Notes" not in df.columns:
+        df["Notes"] = ""
+
+    # Map name_clean -> positions from slate (more reliable than tuple attr)
+    pos_map = dict(zip(slate_df["Name_clean"], slate_df["Positions"]))
+
+    # Identify OUT players in projection df
+    df["Name_clean"] = df["Name"].apply(clean_name)
+    out_mask = df["Name_clean"].isin(out_clean_set)
+
+    # Only bump teammates that have valid projections (Status OK)
+    ok_mask = df["Status"].astype(str).str.startswith("OK")
+    # OUT players used only as "removed minutes/usage" sources if we have a projection
+    out_with_proj = out_mask & df["Status"].astype(str).isin(["OUT", "OUT (included)"])
+
+    # If user marked players OUT but they didn't project, skip bumps (no minutes to redistribute)
+    if out_with_proj.sum() == 0:
+        return df
+
+    # Pre-compute per-minute baseline rates from projections
+    for c in STAT_COLS:
+        pm_col = f"PM_{c}"
+        df[pm_col] = np.where(
+            df["BaseMinutes"].fillna(0) > 0,
+            df[c].fillna(0) / df["BaseMinutes"].replace(0, np.nan),
+            0.0
+        )
+        df[pm_col] = df[pm_col].fillna(0.0)
+
+    # Team-by-team adjustments
+    teams = sorted(df.loc[out_with_proj, "Team"].dropna().unique())
+    for team in teams:
+        team_out = df[(df["Team"] == team) & out_with_proj].copy()
+        team_ok = df[(df["Team"] == team) & ok_mask].copy()
+
+        if team_out.empty or team_ok.empty:
+            continue
+
+        # Total missing minutes and missing "offense involvement" proxy
+        missing_minutes = float(team_out["BaseMinutes"].fillna(0).sum())
+
+        # Offense proxy: PTS + AST + FG3M (from baseline projections)
+        missing_off = float(
+            (team_out["PTS"].fillna(0) + team_out["AST"].fillna(0) + team_out["FG3M"].fillna(0)).sum()
+        )
+
+        if missing_minutes <= 0:
+            continue
+
+        # Recipients: consider everyone OK on team, but weight top candidates
+        cand = team_ok.copy()
+
+        # Base weight uses minutes (starters more likely to soak minutes),
+        # but keep a floor so bench players can jump when their position matches.
+        cand["w_base"] = cand["BaseMinutes"].fillna(0).clip(lower=MIN_BENCH_FLOOR)
+
+        # Add position-match bonus:
+        # If a starting PG is OUT, the backup PG/SG on that team should gain the most minutes.
+        # We'll do this by adding weight to candidates whose DK eligibility overlaps with OUT player eligibility.
+        cand["w_pos"] = 0.0
+        for out_row in team_out.itertuples(index=False):
+            out_key = getattr(out_row, "Name_clean")
+            out_pos = pos_map.get(out_key, []) or []
+            # Bench boost: give extra bonus to lower-minute guys who overlap positions
+            for idx, r in cand.iterrows():
+                if _pos_overlap(r["Positions"], out_pos):
+                    # base bonus
+                    bonus = 10.0
+                    # extra if bench-ish (likely direct backup)
+                    if safe_float(r["BaseMinutes"], 0) < 22:
+                        bonus += 10.0
+                    cand.at[idx, "w_pos"] += bonus
+
+        cand["w_total"] = cand["w_base"] + cand["w_pos"]
+
+        # Pick top N recipients by weight (this is where backups can jump into top N)
+        cand = cand.sort_values("w_total", ascending=False).head(MIN_REDIS_TOP_N).copy()
+
+        total_w = float(cand["w_total"].sum())
+        if total_w <= 0:
+            continue
+
+        # Allocate minute increases
+        minute_increases = {}
+        for _, r in cand.iterrows():
+            share = float(r["w_total"]) / total_w
+            inc = missing_minutes * share
+            inc = min(inc, MAX_MIN_INCREASE)
+
+            base_m = safe_float(r["Minutes"], 0.0)
+            new_m = min(base_m + inc, MAX_MINUTES_PLAYER)
+
+            minute_increases[r["Name_clean"]] = new_m - base_m
+
+        # Apply minute changes and recompute stats from per-minute baselines
+        for name_clean_key, inc in minute_increases.items():
+            if inc <= 0:
+                continue
+            idxs = df.index[(df["Team"] == team) & (df["Name_clean"] == name_clean_key) & ok_mask]
+            if len(idxs) == 0:
+                continue
+            i = idxs[0]
+
+            old_m = safe_float(df.at[i, "Minutes"], 0.0)
+            new_m = min(old_m + inc, MAX_MINUTES_PLAYER)
+            df.at[i, "Minutes"] = new_m
+
+            # Recompute each stat from baseline per-minute rate * new minutes
+            for c in STAT_COLS:
+                pm = safe_float(df.at[i, f"PM_{c}"], 0.0)
+                df.at[i, c] = round(pm * new_m, 2)
+
+            df.at[i, "Notes"] = (str(df.at[i, "Notes"]) + f" MIN+{inc:.1f}").strip()
+
+        # Apply offense per-minute multiplier to top recipients (optional)
+        if missing_off > 0:
+            # Build recipient offense baseline after minute change but using baseline per-minute rates
+            team_ok_after = df[(df["Team"] == team) & ok_mask].copy()
+
+            # Choose recipients: prioritize high w_total guys (same cand) and ball-handlers (AST pm)
+            # We'll merge w_total back in:
+            w_map = dict(zip(cand["Name_clean"], cand["w_total"]))
+            team_ok_after["w_total"] = team_ok_after["Name_clean"].map(w_map).fillna(0.0)
+            team_ok_after["ast_pm"] = team_ok_after["PM_AST"].fillna(0.0)
+            team_ok_after["pts_pm"] = team_ok_after["PM_PTS"].fillna(0.0)
+
+            team_ok_after["off_rank"] = team_ok_after["w_total"] + 40.0 * team_ok_after["ast_pm"] + 10.0 * team_ok_after["pts_pm"]
+            recipients = team_ok_after.sort_values("off_rank", ascending=False).head(OFF_BUMP_TOP_N)
+
+            recipient_off = float((recipients["PTS"].fillna(0) + recipients["AST"].fillna(0) + recipients["FG3M"].fillna(0)).sum())
+            if recipient_off > 0:
+                raw_mult = 1.0 + OFF_BUMP_STRENGTH * (missing_off / recipient_off)
+                mult = min(raw_mult, OFF_BUMP_CAP)
+
+                for idx in recipients.index:
+                    # Multiply offense stats only; keep defense/reb/tov as-is
+                    df.at[idx, "PTS"] = round(safe_float(df.at[idx, "PTS"], 0.0) * mult, 2)
+                    df.at[idx, "AST"] = round(safe_float(df.at[idx, "AST"], 0.0) * mult, 2)
+                    df.at[idx, "FG3M"] = round(safe_float(df.at[idx, "FG3M"], 0.0) * mult, 2)
+                    df.at[idx, "Notes"] = (str(df.at[idx, "Notes"]) + f" OFFx{mult:.2f}").strip()
+
+        # Recompute DK_FP and Value for the whole team OK players (only those affected is fine, but this is cheap)
+        team_ok_final = df.index[(df["Team"] == team) & ok_mask]
+        for i in team_ok_final:
+            stats = {
+                "PTS": safe_float(df.at[i, "PTS"], 0.0),
+                "REB": safe_float(df.at[i, "REB"], 0.0),
+                "AST": safe_float(df.at[i, "AST"], 0.0),
+                "STL": safe_float(df.at[i, "STL"], 0.0),
+                "BLK": safe_float(df.at[i, "BLK"], 0.0),
+                "TOV": safe_float(df.at[i, "TOV"], 0.0),
+                "FG3M": safe_float(df.at[i, "FG3M"], 0.0),
+            }
+            fp = dk_fp(stats)
+            df.at[i, "DK_FP"] = fp
+            sal = safe_float(df.at[i, "Salary"], 0.0)
+            df.at[i, "Value"] = (fp / (sal / 1000.0)) if sal > 0 else np.nan
+
+    return df
 
 # ==========================
 # Sidebar
@@ -242,6 +462,11 @@ with st.sidebar:
     max_team = st.number_input("Max players per team (0 = no limit)", 0, 8, st.session_state.get("max_team", 4))
     st.session_state["max_team"] = int(max_team)
 
+    st.divider()
+    st.subheader("Bumps")
+    enable_bumps_ui = st.checkbox("Enable teammate bumps when players are OUT", value=st.session_state.get("enable_bumps_ui", True))
+    st.session_state["enable_bumps_ui"] = bool(enable_bumps_ui)
+
 st.write(f"**Season:** {SEASON}  |  **Salary cap:** ${DK_SALARY_CAP:,}  |  **Slots:** {', '.join(DK_SLOTS)}")
 
 if not dk_file:
@@ -271,12 +496,22 @@ st.dataframe(
 # Build projections
 # ==========================
 st.subheader("Projections (Full Slate)")
-build_btn = st.button("Build/Refresh Projections")
+
+col1, col2 = st.columns([1, 2])
+with col1:
+    build_btn = st.button("Build/Refresh Projections")
+with col2:
+    st.caption("Cloud note: NBA Stats can time out. Use retries + ‘Retry ERR Players Only’ for stragglers.")
 
 if "proj_df" not in st.session_state:
     st.session_state["proj_df"] = None
 
 def build_projections(slate_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    IMPORTANT change:
+    - We still TRY to project OUT players so we know their minutes/usage for teammate bumps.
+    - They are excluded from the optimizer pool later if exclude_out is enabled.
+    """
     rows = []
     total = len(slate_df)
     prog = st.progress(0, text="Projecting players...")
@@ -284,30 +519,18 @@ def build_projections(slate_df: pd.DataFrame) -> pd.DataFrame:
     for i, r in enumerate(slate_df.itertuples(index=False), start=1):
         prog.progress(int(i / max(total, 1) * 100), text=f"Running gamelog({r.Name}) ({i}/{total})...")
 
-        # OUT handling (show as 0s + OUT)
-        if r.IsOutManual and st.session_state["exclude_out"]:
-            rows.append({
-                "Name": r.Name,
-                "Team": r.Team,
-                "Positions": r.Positions,
-                "Salary": float(r.Salary) if pd.notna(r.Salary) else np.nan,
-                "Minutes": 0.0,
-                "PTS": 0.0, "REB": 0.0, "AST": 0.0, "FG3M": 0.0, "STL": 0.0, "BLK": 0.0, "TOV": 0.0,
-                "DK_FP": 0.0,
-                "Value": 0.0,
-                "Status": "OUT",
-            })
-            continue
-
         try:
             mins, fp, stats = project_player(r.Name, int(st.session_state["last_n"]))
-            value = (fp / (float(r.Salary) / 1000.0)) if (pd.notna(r.Salary) and float(r.Salary) > 0) else np.nan
+            sal = float(r.Salary) if pd.notna(r.Salary) else np.nan
+            value = (fp / (sal / 1000.0)) if (pd.notna(sal) and sal > 0) else np.nan
+
+            status = "OUT" if r.IsOutManual else "OK"
 
             rows.append({
                 "Name": r.Name,
                 "Team": r.Team,
                 "Positions": r.Positions,
-                "Salary": float(r.Salary) if pd.notna(r.Salary) else np.nan,
+                "Salary": sal,
                 "Minutes": mins,
                 "PTS": stats["PTS"],
                 "REB": stats["REB"],
@@ -318,11 +541,11 @@ def build_projections(slate_df: pd.DataFrame) -> pd.DataFrame:
                 "TOV": stats["TOV"],
                 "DK_FP": fp,
                 "Value": value,
-                "Status": "OK" if not r.IsOutManual else "OUT (included)",
+                "Status": status,
             })
 
         except Exception as e:
-            # IMPORTANT: ERR rows are not faked as zeros anymore
+            # ERR rows are not faked as zeros
             rows.append({
                 "Name": r.Name,
                 "Team": r.Team,
@@ -332,40 +555,99 @@ def build_projections(slate_df: pd.DataFrame) -> pd.DataFrame:
                 "PTS": np.nan, "REB": np.nan, "AST": np.nan, "FG3M": np.nan, "STL": np.nan, "BLK": np.nan, "TOV": np.nan,
                 "DK_FP": np.nan,
                 "Value": np.nan,
-                "Status": f"ERR: {str(e)[:80]}",
+                "Status": f"ERR: {str(e)[:90]}",
             })
 
-        # tiny throttle to reduce rate limit risk
-        time.sleep(0.03)
+        time.sleep(BUILD_THROTTLE_SECONDS)
 
     prog.empty()
     return pd.DataFrame(rows)
 
+def retry_err_players(proj_df: pd.DataFrame, slate_df: pd.DataFrame) -> pd.DataFrame:
+    err_mask = proj_df["Status"].astype(str).str.startswith("ERR")
+    err_names = proj_df.loc[err_mask, "Name"].tolist()
+    if not err_names:
+        return proj_df
+
+    prog = st.progress(0, text="Retrying ERR players only...")
+    proj_df = proj_df.copy()
+
+    # For correct OUT/OK status after retry
+    out_clean = parse_out_list(st.session_state.get("out_text", ""))
+    out_name_clean_map = {clean_name(n): True for n in out_clean}
+
+    for i, nm in enumerate(err_names, start=1):
+        prog.progress(int(i / max(len(err_names), 1) * 100), text=f"Retrying {nm} ({i}/{len(err_names)})...")
+
+        try:
+            mins, fp, stats = project_player(nm, int(st.session_state["last_n"]))
+            sal = float(proj_df.loc[proj_df["Name"] == nm, "Salary"].iloc[0])
+            value = (fp / (sal / 1000.0)) if sal and sal > 0 else np.nan
+
+            status = "OUT" if out_name_clean_map.get(clean_name(nm), False) else "OK"
+
+            proj_df.loc[proj_df["Name"] == nm, ["Minutes","PTS","REB","AST","FG3M","STL","BLK","TOV","DK_FP","Value","Status"]] = [
+                mins, stats["PTS"], stats["REB"], stats["AST"], stats["FG3M"], stats["STL"], stats["BLK"], stats["TOV"],
+                fp, value, status
+            ]
+        except Exception as e:
+            proj_df.loc[proj_df["Name"] == nm, "Status"] = f"ERR: {str(e)[:90]}"
+
+        time.sleep(RETRY_THROTTLE_SECONDS)
+
+    prog.empty()
+    return proj_df
+
+# Build on first load or when clicked
 if build_btn or st.session_state["proj_df"] is None:
     st.session_state["proj_df"] = build_projections(slate)
+
+# Apply bumps after projections build
+if ENABLE_OUT_BUMPS and st.session_state.get("enable_bumps_ui", True):
+    st.session_state["proj_df"] = apply_out_bumps(st.session_state["proj_df"], slate, manual_out)
 
 proj_df = st.session_state["proj_df"].copy()
 proj_df = proj_df.sort_values("DK_FP", ascending=False)
 
-# Display-friendly column name "3PM"
+# Display-friendly 3PM column
 display_df = proj_df.rename(columns={"FG3M": "3PM"})
 
 st.dataframe(
-    display_df[["Name","Team","Positions","Salary","Minutes","PTS","REB","AST","3PM","STL","BLK","TOV","DK_FP","Value","Status"]],
+    display_df[[
+        "Name","Team","Positions","Salary",
+        "Minutes","PTS","REB","AST","3PM","STL","BLK","TOV",
+        "DK_FP","Value","Status",
+        "Notes" if "Notes" in display_df.columns else "Status"
+    ]],
     use_container_width=True,
     hide_index=True
 )
 
+# Retry ERR players only
+retry_btn = st.button("Retry ERR Players Only")
+if retry_btn:
+    st.session_state["proj_df"] = retry_err_players(st.session_state["proj_df"], slate)
+    # re-apply bumps after retry
+    if ENABLE_OUT_BUMPS and st.session_state.get("enable_bumps_ui", True):
+        manual_out = parse_out_list(st.session_state.get("out_text", ""))
+        st.session_state["proj_df"] = apply_out_bumps(st.session_state["proj_df"], slate, manual_out)
+
+    st.success("Retried ERR players (and re-applied bumps).")
+    proj_df = st.session_state["proj_df"].copy().sort_values("DK_FP", ascending=False)
+
 # ==========================
 # Build optimizer pool
 # ==========================
-pool = proj_df.copy()
+pool = st.session_state["proj_df"].copy()
 
-# only rows with real projections
+# Only rows with real projections
 pool = pool.dropna(subset=["Salary", "DK_FP"])
 pool = pool[pool["Salary"] > 0]
-pool = pool[pool["Status"].isin(["OK", "OUT (included)"])]
 
+# Keep only OK (and optionally OUT included)
+pool = pool[pool["Status"].isin(["OK"])]
+
+# Exclude OUT if option enabled (OUT never in pool)
 if st.session_state["exclude_out"]:
     pool = pool[pool["Status"] != "OUT"]
 
@@ -378,7 +660,7 @@ exclude_players = st.multiselect("Exclude players", options=pool_names, default=
 pool = pool[~pool["Name"].isin(exclude_players)].copy()
 
 # ==========================
-# Optimizer (FIXED: fills all 8 slots)
+# Optimizer (fills all 8 slots)
 # ==========================
 def optimize(pool_df: pd.DataFrame) -> pd.DataFrame:
     prob = LpProblem("DK_NBA_CLASSIC", LpMaximize)
@@ -388,28 +670,22 @@ def optimize(pool_df: pd.DataFrame) -> pd.DataFrame:
     if n == 0:
         raise ValueError("Optimizer pool is empty. (Check OUT / ERR / exclude settings.)")
 
-    # decision vars: x[i,slot]
     x = {}
     for i in range(n):
         for slot in DK_SLOTS:
             if slot_eligible(rows[i]["Positions"], slot):
                 x[(i, slot)] = LpVariable(f"x_{i}_{slot}", 0, 1, LpBinary)
 
-    # objective
     prob += lpSum(rows[i]["DK_FP"] * x[(i, slot)] for (i, slot) in x)
 
-    # each slot exactly once
     for slot in DK_SLOTS:
         prob += lpSum(x[(i, slot)] for i in range(n) if (i, slot) in x) == 1, f"fill_{slot}"
 
-    # each player at most once
     for i in range(n):
         prob += lpSum(x[(i, slot)] for slot in DK_SLOTS if (i, slot) in x) <= 1, f"use_once_{i}"
 
-    # salary cap
     prob += lpSum(rows[i]["Salary"] * x[(i, slot)] for (i, slot) in x) <= DK_SALARY_CAP, "salary_cap"
 
-    # max players per team
     max_team = int(st.session_state.get("max_team", 0))
     if max_team and max_team > 0:
         teams_unique = sorted(set(r["Team"] for r in rows))
@@ -417,17 +693,14 @@ def optimize(pool_df: pd.DataFrame) -> pd.DataFrame:
             idxs = [i for i in range(n) if rows[i]["Team"] == t]
             prob += lpSum(x[(i, slot)] for i in idxs for slot in DK_SLOTS if (i, slot) in x) <= max_team, f"max_{t}"
 
-    # locks
     for lp in lock_players:
         idxs = [i for i in range(n) if rows[i]["Name"] == lp]
         if idxs:
             i = idxs[0]
             prob += lpSum(x[(i, slot)] for slot in DK_SLOTS if (i, slot) in x) == 1, f"lock_{i}"
 
-    # solve
     prob.solve(PULP_CBC_CMD(msg=False))
 
-    # extract lineup
     lineup_rows = []
     for slot in DK_SLOTS:
         chosen_i = None
@@ -455,6 +728,7 @@ def optimize(pool_df: pd.DataFrame) -> pd.DataFrame:
             "TOV": r["TOV"],
             "DK_FP": round(float(r["DK_FP"]), 2),
             "Value": r["Value"],
+            "Notes": r.get("Notes", "")
         })
 
     return pd.DataFrame(lineup_rows)
