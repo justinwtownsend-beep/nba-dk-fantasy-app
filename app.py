@@ -462,7 +462,7 @@ edited = st.data_editor(
     disabled=["Name", "Team", "Positions", "Salary", "GameInfo"],
 )
 
-# ---- LIVE OUT SET FROM CHECKBOXES (THIS FIXES YOUR ISSUE) ----
+# ---- LIVE OUT SET FROM CHECKBOXES ----
 name_to_clean = dict(zip(slate_view["Name"], slate_view["Name_clean"]))
 live_flags = {}
 for _, row in edited.iterrows():
@@ -470,10 +470,6 @@ for _, row in edited.iterrows():
     cl = name_to_clean.get(nm, clean_name(nm))
     live_flags[cl] = bool(row["OUT"])
 out_clean_set = {k for k, v in live_flags.items() if v}
-
-# Optional: show who is OUT (helps sanity-check)
-with st.expander("Debug: current OUT selections"):
-    st.write(sorted(list(out_clean_set))[:50])
 
 # Show last saved projections (no recompute)
 if proj_text:
@@ -550,8 +546,7 @@ if run_proj:
     if ENABLE_OUT_BUMPS and out_clean_set:
         full_proj_df = apply_out_bumps(full_proj_df)
 
-    # ---- BULLETPROOF OUT REMOVAL ----
-    # Remove OUT from projections even if Status ever mislabels them.
+    # BULLETPROOF OUT REMOVAL
     if "Name_clean" not in full_proj_df.columns:
         full_proj_df["Name_clean"] = full_proj_df["Name"].apply(clean_name)
 
@@ -560,8 +555,8 @@ if run_proj:
         (~full_proj_df["Name_clean"].isin(out_clean_set))
     ].copy()
 
-    display_df = proj_df.rename(columns={"FG3M": "3PM"}).copy()
-    display_df = display_df.sort_values("DK_FP", ascending=False)
+    # Save projections with FG3M (do NOT rename to 3PM before saving)
+    display_df = proj_df.copy().sort_values("DK_FP", ascending=False)
 
     gist_update_files(GIST_ID, {
         GIST_FILE_PROJ: display_df.to_csv(index=False),
@@ -570,7 +565,8 @@ if run_proj:
 
     st.success("Projections complete and saved. Phone/desktop will show these without re-running.")
     st.subheader("Projections (OUT removed, bumps applied)")
-    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    # Show 3PM label for humans (but keep FG3M in data for optimizer)
+    st.dataframe(display_df.rename(columns={"FG3M": "3PM"}), use_container_width=True, hide_index=True)
 
     latest_display_df = display_df
 
@@ -591,6 +587,10 @@ else:
 if pool_df is None or pool_df.empty:
     st.info("No projections saved yet. Run projections first.")
     st.stop()
+
+# ---- FIX: FG3M vs 3PM (handles older saved projection files) ----
+if "FG3M" not in pool_df.columns and "3PM" in pool_df.columns:
+    pool_df["FG3M"] = pool_df["3PM"]
 
 # Restore Positions to list after CSV reload
 def parse_positions_cell(x):
