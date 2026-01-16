@@ -91,6 +91,7 @@ def dk_fp(stats: dict) -> float:
 
     fp = pts + 1.25 * reb + 1.5 * ast + 2 * stl + 2 * blk - 0.5 * tov + 0.5 * tpm
 
+    # DK bonuses
     cats_10 = sum([pts >= 10, reb >= 10, ast >= 10, stl >= 10, blk >= 10])
     if cats_10 >= 2:
         fp += 1.5
@@ -259,11 +260,8 @@ def read_dk_csv(uploaded_or_text) -> pd.DataFrame:
 # OUT bumps
 # ==========================
 def apply_out_bumps(full_proj_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    full_proj_df contains ALL players including OUT with Status='OUT'.
-    We redistribute OUT minutes to teammates and apply a small offense bump.
-    """
     df = full_proj_df.copy()
+
     ok_mask = df["Status"].astype(str) == "OK"
     out_mask = df["Status"].astype(str) == "OUT"
 
@@ -295,6 +293,7 @@ def apply_out_bumps(full_proj_df: pd.DataFrame) -> pd.DataFrame:
             continue
         weights = weights / wsum
 
+        # Minutes redistribution
         for idx in team_ok.index:
             inc = min(float(weights.loc[idx]) * missing_min, MAX_MIN_INCREASE)
             old_m = safe_float(df.at[idx, "Minutes"], 0.0)
@@ -307,7 +306,7 @@ def apply_out_bumps(full_proj_df: pd.DataFrame) -> pd.DataFrame:
             if inc > 0:
                 df.at[idx, "Notes"] = (str(df.at[idx, "Notes"]) + f" MIN+{inc:.1f}").strip()
 
-        # Offense bump to top recipients
+        # Small offense bump
         team_ok2 = df[(df["Team"] == team) & ok_mask].copy()
         team_ok2["rank"] = team_ok2["Minutes"].fillna(0) + 40.0 * team_ok2["PM_AST"].fillna(0)
         recipients = team_ok2.sort_values("rank", ascending=False).head(OFF_BUMP_TOP_N)
@@ -324,7 +323,7 @@ def apply_out_bumps(full_proj_df: pd.DataFrame) -> pd.DataFrame:
                 df.at[idx, "FG3M"] = round(safe_float(df.at[idx, "FG3M"], 0.0) * mult, 2)
                 df.at[idx, "Notes"] = (str(df.at[idx, "Notes"]) + f" OFFx{mult:.2f}").strip()
 
-        # Recompute DK_FP / Value for team OK players
+        # Recompute DK_FP / Value
         for idx in df.index[(df["Team"] == team) & ok_mask]:
             stats = {c: safe_float(df.at[idx, c], 0.0) for c in STAT_COLS}
             df.at[idx, "DK_FP"] = dk_fp(stats)
@@ -436,7 +435,10 @@ else:
         st.stop()
     slate_df = read_dk_csv(slate_text)
 
-# Load saved OUT flags
+# Load saved projections (for display without recompute)
+proj_text = gist_read_file(gist_json, GIST_FILE_PROJ)
+
+# Load saved OUT flags (we still read them, but projections will use LIVE checkboxes)
 out_flags_text = gist_read_file(gist_json, GIST_FILE_OUT)
 saved_out_flags = {}
 if out_flags_text:
@@ -445,12 +447,12 @@ if out_flags_text:
     except Exception:
         saved_out_flags = {}
 
-# Add OUT checkbox column
+# Add OUT checkbox column (defaults from saved)
 slate_view = slate_df.copy()
 slate_view["OUT"] = slate_view["Name_clean"].map(lambda k: bool(saved_out_flags.get(k, False)))
 
 st.write(f"**Season:** {SEASON}  |  **Cap:** ${DK_SALARY_CAP:,}  |  **Slots:** {', '.join(DK_SLOTS)}")
-st.subheader("Step 1 — Mark OUT players (checkbox). Nothing runs yet.")
+st.subheader("Step 1 — Mark OUT players (checkbox). Projections only run when you click Run Projections.")
 
 edited = st.data_editor(
     slate_view[["OUT", "Name", "Team", "Positions", "Salary", "GameInfo"]],
@@ -460,23 +462,20 @@ edited = st.data_editor(
     disabled=["Name", "Team", "Positions", "Salary", "GameInfo"],
 )
 
-save_out = st.button("Save OUT selections")
-if save_out:
-    # Save by Name_clean
-    name_to_clean = dict(zip(slate_view["Name"], slate_view["Name_clean"]))
-    new_flags = {}
-    for _, row in edited.iterrows():
-        nm = str(row["Name"])
-        cl = name_to_clean.get(nm, clean_name(nm))
-        new_flags[cl] = bool(row["OUT"])
-    gist_update_files(GIST_ID, {GIST_FILE_OUT: json.dumps(new_flags, indent=2)})
-    st.success("Saved OUT selections.")
-    saved_out_flags = new_flags
+# ---- LIVE OUT SET FROM CHECKBOXES (THIS FIXES YOUR ISSUE) ----
+name_to_clean = dict(zip(slate_view["Name"], slate_view["Name_clean"]))
+live_flags = {}
+for _, row in edited.iterrows():
+    nm = str(row["Name"])
+    cl = name_to_clean.get(nm, clean_name(nm))
+    live_flags[cl] = bool(row["OUT"])
+out_clean_set = {k for k, v in live_flags.items() if v}
 
-out_clean_set = {k for k, v in saved_out_flags.items() if v}
+# Optional: show who is OUT (helps sanity-check)
+with st.expander("Debug: current OUT selections"):
+    st.write(sorted(list(out_clean_set))[:50])
 
 # Show last saved projections (no recompute)
-proj_text = gist_read_file(gist_json, GIST_FILE_PROJ)
 if proj_text:
     try:
         last_proj = pd.read_csv(StringIO(proj_text))
@@ -488,16 +487,20 @@ if proj_text:
 st.divider()
 st.subheader("Step 2 — Run projections (only when you click)")
 
-run_proj = st.button("Run Projections (apply OUT bumps, then save results)")
+run_proj = st.button("Run Projections (apply OUT bumps, remove OUT from projections, save results)")
 latest_display_df = None
 
 if run_proj:
+    # Persist OUT selections automatically on projection run (phone + desktop sync)
+    gist_update_files(GIST_ID, {GIST_FILE_OUT: json.dumps(live_flags, indent=2)})
+
     rows = []
     total = len(slate_df)
     progress = st.progress(0, text="Starting projections...")
 
     for i, r in enumerate(slate_df.itertuples(index=False), start=1):
         progress.progress(int(i / max(total, 1) * 100), text=f"Running gamelog({r.Name}) ({i}/{total})")
+
         status = "OUT" if r.Name_clean in out_clean_set else "OK"
 
         try:
@@ -547,8 +550,15 @@ if run_proj:
     if ENABLE_OUT_BUMPS and out_clean_set:
         full_proj_df = apply_out_bumps(full_proj_df)
 
-    # Remove OUT players from displayed projections
-    proj_df = full_proj_df[full_proj_df["Status"] == "OK"].copy()
+    # ---- BULLETPROOF OUT REMOVAL ----
+    # Remove OUT from projections even if Status ever mislabels them.
+    if "Name_clean" not in full_proj_df.columns:
+        full_proj_df["Name_clean"] = full_proj_df["Name"].apply(clean_name)
+
+    proj_df = full_proj_df[
+        (full_proj_df["Status"] == "OK") &
+        (~full_proj_df["Name_clean"].isin(out_clean_set))
+    ].copy()
 
     display_df = proj_df.rename(columns={"FG3M": "3PM"}).copy()
     display_df = display_df.sort_values("DK_FP", ascending=False)
@@ -582,7 +592,7 @@ if pool_df is None or pool_df.empty:
     st.info("No projections saved yet. Run projections first.")
     st.stop()
 
-# Restore Positions to list
+# Restore Positions to list after CSV reload
 def parse_positions_cell(x):
     if isinstance(x, list):
         return x
