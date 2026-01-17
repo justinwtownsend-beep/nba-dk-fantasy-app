@@ -1,6 +1,7 @@
 import json
 import time
 import random
+import difflib
 from io import StringIO
 
 import numpy as np
@@ -169,19 +170,43 @@ def gist_read_file(gist_json: dict, filename: str):
 # ==========================
 # NBA helpers (IDs, logs, caching)
 # ==========================
-@st.cache_data(ttl=86400)
+@st.cache_data(ttl=3600)  # was 86400; reduce staleness in case player list updates
 def player_id_map():
     plist = nba_players.get_players()
     return {clean_name(p["full_name"]): int(p["id"]) for p in plist}
 
 def get_player_id(name: str) -> int:
+    # 1) exact match
     key = clean_name(name)
     m = player_id_map()
     if key in m:
         return m[key]
+
+    # 2) full-name search
     matches = nba_players.find_players_by_full_name(name)
     if matches:
         return int(matches[0]["id"])
+
+    # 3) last-name fallback + fuzzy selection
+    parts = str(name).strip().split()
+    if not parts:
+        raise ValueError(f"Player not found: {name}")
+
+    last = parts[-1]
+    last_matches = nba_players.find_players_by_last_name(last) or []
+    if last_matches:
+        target = clean_name(name)
+        best = None
+        best_score = -1.0
+        for cand in last_matches:
+            cand_name = cand.get("full_name", "")
+            score = difflib.SequenceMatcher(None, target, clean_name(cand_name)).ratio()
+            if score > best_score:
+                best_score = score
+                best = cand
+        if best is not None and best_score >= 0.55:
+            return int(best["id"])
+
     raise ValueError(f"Player not found: {name}")
 
 @st.cache_data(ttl=86400)
@@ -399,10 +424,6 @@ def absence_game_ids_for_player(team_abbrev: str, out_player_name: str):
     return abs_ids, len(abs_ids)
 
 def apply_absence_bumps(df_in: pd.DataFrame, out_clean_set: set) -> tuple[pd.DataFrame, set]:
-    """
-    Returns (df_after, teams_used_absence).
-    For teams where no absence profile is usable, it does NOT change them.
-    """
     df = df_in.copy()
     if "Notes" not in df.columns:
         df["Notes"] = ""
@@ -410,8 +431,8 @@ def apply_absence_bumps(df_in: pd.DataFrame, out_clean_set: set) -> tuple[pd.Dat
         df["Name_clean"] = df["Name"].apply(clean_name)
 
     teams_used_absence = set()
-
     teams_with_out = df[df["Name_clean"].isin(out_clean_set)]["Team"].dropna().unique()
+
     for team in teams_with_out:
         out_rows = df[(df["Team"] == team) & (df["Name_clean"].isin(out_clean_set))].copy()
         ok_rows = df[(df["Team"] == team) & (df["Status"] == "OK")].copy()
@@ -718,7 +739,6 @@ if run_proj:
             except Exception:
                 teams_used_absence = set()
 
-        # fallback bumps for teams where absence bumps weren't used
         if use_fallback_bumps:
             for t in full_proj_df[(full_proj_df["Status"] == "OUT")]["Team"].dropna().unique():
                 if t not in teams_used_absence:
@@ -743,7 +763,7 @@ if run_proj:
                 hits = full_proj_df[full_proj_df["Name_clean"].str.contains(key, na=False)]
                 st.dataframe(hits, use_container_width=True, hide_index=True)
 
-    # Bulletproof OUT removal (remove OUT players even if status weird)
+    # OUT removal
     if "Name_clean" not in full_proj_df.columns:
         full_proj_df["Name_clean"] = full_proj_df["Name"].apply(clean_name)
 
