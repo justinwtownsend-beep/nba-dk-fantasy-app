@@ -2,14 +2,15 @@
 # DraftKings NBA Optimizer
 # FAST MODE (Streamlit Cloud Friendly)
 # - Step A uses ONE league endpoint (fast)
+# - Name matching fixed (diacritics like Dončić -> Doncic)
 # - OUT bumps redistribute minutes and scale stats correctly
 # - Missing players debug
 # - Optimizer fixed (no duplicates)
 # ==========================
 
 import json
-import time
 import difflib
+import unicodedata
 from io import StringIO
 
 import numpy as np
@@ -29,7 +30,7 @@ DK_SALARY_CAP = 50000
 DK_SLOTS = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
 STAT_COLS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M"]
 
-API_TIMEOUT = 20  # one call now
+API_TIMEOUT = 20
 MAX_MINUTES = 40
 BENCH_FLOOR = 6
 
@@ -50,11 +51,21 @@ st.title("DraftKings NBA Optimizer — FAST Mode")
 # ==========================
 SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
 
-def clean_name(s):
-    s = str(s).lower().replace(".", "").replace(",", "")
+def deaccent(s: str) -> str:
+    """Turn Dončić -> Doncic, Šarić -> Saric, Jokić -> Jokic, etc."""
+    s = str(s)
+    return (
+        unicodedata.normalize("NFKD", s)
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+
+def clean_name(s: str) -> str:
+    s = deaccent(s).lower()
+    s = s.replace(".", "").replace(",", "").replace("’", "'").replace("`", "'")
     return " ".join(s.split())
 
-def strip_suffix(name):
+def strip_suffix(name: str) -> str:
     parts = clean_name(name).split()
     if parts and parts[-1] in SUFFIXES:
         parts = parts[:-1]
@@ -127,40 +138,58 @@ def gist_write(files):
 # ==========================
 @st.cache_data(ttl=900)
 def league_stats_df():
-    # ONE call for the whole league season-to-date
     df = leaguedashplayerstats.LeagueDashPlayerStats(
         season=SEASON,
         per_mode_detailed="PerGame",
         timeout=API_TIMEOUT
     ).get_data_frames()[0]
 
-    # Keep what we need
     keep = ["PLAYER_NAME", "TEAM_ABBREVIATION", "MIN", "PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M"]
     df = df[keep].copy()
     df.columns = ["NBA_Name", "NBA_Team", "MIN", "PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M"]
+
     df["NBA_Name_clean"] = df["NBA_Name"].apply(clean_name)
     df["NBA_Name_stripped"] = df["NBA_Name"].apply(strip_suffix)
-    df["NBA_Name_stripped"] = df["NBA_Name_stripped"].apply(clean_name)
+    df["NBA_Last"] = df["NBA_Name_clean"].apply(lambda x: x.split()[-1] if isinstance(x, str) and x.split() else "")
+
     return df
 
 def match_player_to_nba(slate_name, nba_df):
-    # Try exact on clean and stripped
     cn = clean_name(slate_name)
     sn = strip_suffix(slate_name)
 
+    # exact clean
     exact = nba_df[nba_df["NBA_Name_clean"] == cn]
     if not exact.empty:
         return exact.iloc[0]
 
+    # exact stripped (removes Jr/III etc.)
     exact2 = nba_df[nba_df["NBA_Name_stripped"] == sn]
     if not exact2.empty:
         return exact2.iloc[0]
 
-    # Fuzzy fallback (limited)
+    # last-name filtered fuzzy (much safer than fuzzy vs whole league)
+    parts = sn.split()
+    if parts:
+        last = parts[-1]
+        cand = nba_df[nba_df["NBA_Last"] == last]
+        if not cand.empty:
+            # choose best similarity
+            best_row = None
+            best_score = 0.0
+            for _, row in cand.iterrows():
+                score = difflib.SequenceMatcher(None, sn, row["NBA_Name_stripped"]).ratio()
+                if score > best_score:
+                    best_row = row
+                    best_score = score
+            if best_row is not None and best_score >= 0.75:
+                return best_row
+
+    # fallback: tight fuzzy on whole list (higher cutoff to avoid wrong matches)
     candidates = nba_df["NBA_Name_clean"].tolist()
-    best = difflib.get_close_matches(cn, candidates, n=1, cutoff=0.86)
-    if best:
-        return nba_df[nba_df["NBA_Name_clean"] == best[0]].iloc[0]
+    hit = difflib.get_close_matches(cn, candidates, n=1, cutoff=0.90)
+    if hit:
+        return nba_df[nba_df["NBA_Name_clean"] == hit[0]].iloc[0]
 
     return None
 
@@ -231,33 +260,31 @@ if st.button("Build BASE (FAST)"):
 
     for i, r in slate.iterrows():
         prog.progress((i + 1) / len(slate), text=f"Mapping {r['Name']} ({i+1}/{len(slate)})")
-        try:
-            hit = match_player_to_nba(r["Name"], nba_df)
-            if hit is None:
-                row = {**r.to_dict(),
-                       "Minutes": np.nan, **{c: np.nan for c in STAT_COLS},
-                       "Status": "ERR",
-                       "Notes": "No match in league stats (name mismatch / not in NBA stats)"}  # <- key info
-            else:
-                # season-to-date per-game
-                mins = float(hit["MIN"])
-                stats = {c: float(hit[c]) for c in STAT_COLS}
-                row = {**r.to_dict(), "Minutes": mins, **stats, "Status": "OK", "Notes": ""}
-        except Exception as e:
-            row = {**r.to_dict(),
-                   "Minutes": np.nan, **{c: np.nan for c in STAT_COLS},
-                   "Status": "ERR",
-                   "Notes": str(e)[:200]}
+        hit = match_player_to_nba(r["Name"], nba_df)
+        if hit is None:
+            row = {
+                **r.to_dict(),
+                "Minutes": np.nan,
+                **{c: np.nan for c in STAT_COLS},
+                "Status": "ERR",
+                "Notes": "No match in league stats (name mismatch / not in NBA stats)"
+            }
+        else:
+            mins = float(hit["MIN"])
+            stats = {c: float(hit[c]) for c in STAT_COLS}
+            row = {**r.to_dict(), "Minutes": mins, **stats, "Status": "OK", "Notes": ""}
+
         rows.append(row)
 
     base = pd.DataFrame(rows)
     base["DK_FP"] = base.apply(lambda rr: dk_fp(rr) if rr["Status"] == "OK" else np.nan, axis=1)
     gist_write({GIST_BASE: base.to_csv(index=False)})
+
     st.success("Saved BASE (FAST)")
-    st.dataframe(base[["Name","Team","Salary","Minutes","DK_FP","Status"]], use_container_width=True)
+    st.dataframe(base[["Name", "Team", "Salary", "Minutes", "DK_FP", "Status"]], use_container_width=True)
 
 # ==========================
-# STEP B — APPLY OUT (FAST) + DEBUG MISSING
+# STEP B — APPLY OUT + DEBUG
 # ==========================
 st.divider()
 st.subheader("Step B — Apply OUT + Save FINAL")
@@ -277,7 +304,6 @@ if st.button("Apply OUT (fast)"):
     base["Status"] = base["Status"].astype(str)
     base["Notes"] = base.get("Notes", "").fillna("").astype(str)
 
-    # Keep bump notes separate
     base["BumpNotes"] = ""
 
     # mark OUT
@@ -293,7 +319,7 @@ if st.button("Apply OUT (fast)"):
         )
         base[f"PM_{c}"] = base[f"PM_{c}"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    # redistribute minutes by team (multi-out safe)
+    # redistribute minutes by team
     for team in base["Team"].dropna().unique():
         out_t = base[(base["Team"] == team) & (base["Status"] == "OUT")]
         ok_t = base[(base["Team"] == team) & (base["Status"] == "OK")]
@@ -314,7 +340,7 @@ if st.button("Apply OUT (fast)"):
             base.loc[idx, "Minutes"] = min(float(base.loc[idx, "Minutes"]) + inc, MAX_MINUTES)
             base.loc[idx, "BumpNotes"] = (base.loc[idx, "BumpNotes"] + f" MIN+{inc:.1f}").strip()
 
-    # recompute stats from locked per-minute rates
+    # recompute stats
     for idx in base.index[base["Status"] == "OK"]:
         m = base.loc[idx, "Minutes"]
         if pd.isna(m) or float(m) <= 0:
@@ -377,15 +403,12 @@ else:
 
         prob += lpSum(pool.loc[i, "DK_FP"] * x[(i, slot)] for (i, slot) in x)
 
-        # one player per slot
         for slot in DK_SLOTS:
             prob += lpSum(x[(i, slot)] for i in pool.index if (i, slot) in x) == 1
 
-        # player max once (no duplicates)
         for i in pool.index:
             prob += lpSum(x[(i, slot)] for slot in DK_SLOTS if (i, slot) in x) <= 1
 
-        # salary cap
         prob += lpSum(pool.loc[i, "Salary"] * x[(i, slot)] for (i, slot) in x) <= DK_SALARY_CAP
 
         prob.solve(PULP_CBC_CMD(msg=False))
