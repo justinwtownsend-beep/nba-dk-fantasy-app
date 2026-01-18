@@ -25,33 +25,40 @@ DK_SALARY_CAP = 50000
 DK_SLOTS = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
 STAT_COLS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M"]
 
-# Cloud stability
-API_TIMEOUT_SECONDS = 35
-GAMELOG_RETRIES = 4
-BUILD_THROTTLE_SECONDS = 0.10
+# Streamlit Cloud stability
+API_TIMEOUT_SECONDS = 28
+GAMELOG_RETRIES = 3
+BUILD_THROTTLE_SECONDS = 0.05
 
-# Old bump engine (fallback / also used when sample too small)
+# Old heuristic bump engine (fallback, always fast)
 MIN_BENCH_FLOOR = 6.0
 MAX_MINUTES_PLAYER = 40.0
 MAX_MIN_INCREASE = 22.0
-
 OFF_BUMP_STRENGTH = 0.22
 OFF_BUMP_CAP = 1.25
 OFF_BUMP_TOP_N = 6
 
-# Season-only Historical Absence Bumps (recommended)
-MIN_ABSENCE_GAMES = 3              # must have at least this many missed games to trust absences
-MAX_OUT_PLAYERS_PER_TEAM = 3       # safety
-ABS_MIN_DELTA_CAP = 10.0           # max minutes added from absence profile per OUT player
-ABS_MIN_DELTA_FLOOR = -4.0         # allow small decreases
-ABS_STAT_MULT_MIN = 0.85           # cap multipliers so it doesn't go crazy
-ABS_STAT_MULT_MAX = 1.25
-ABS_STACK_MULT_MAX = 1.35          # cap stacking from multiple OUTs
+# Absence profile (season-only, game-level with/without)
+MIN_ABSENCE_GAMES = 3
+MAX_OUT_PLAYERS_PER_TEAM = 3
 
-# Gist file names
+ABS_MIN_DELTA_CAP = 10.0
+ABS_MIN_DELTA_FLOOR = -4.0
+
+ABS_STAT_MULT_MIN = 0.85
+ABS_STAT_MULT_MAX = 1.25
+ABS_STACK_MULT_MAX = 1.35
+
+# Which OUT candidates to precompute profiles for (limits runtime)
+OUT_CANDIDATE_MIN_MINUTES = 24.0
+OUT_CANDIDATE_MIN_SALARY = 5500
+
+# Gist storage
 GIST_FILE_SLATE = "latest_dk_slate.csv"
 GIST_FILE_OUT = "out_flags.json"
-GIST_FILE_PROJ = "latest_projections.csv"
+GIST_FILE_BASE = "base_projections_full.csv"
+GIST_FILE_ABS = "absence_profiles.json"     # <- NEW: precomputed teammate bumps
+GIST_FILE_FINAL = "latest_projections.csv"
 GIST_FILE_META = "meta.json"
 
 
@@ -59,11 +66,11 @@ GIST_FILE_META = "meta.json"
 # PAGE
 # ==========================
 st.set_page_config(page_title="DK NBA Optimizer", layout="wide", initial_sidebar_state="expanded")
-st.title("DraftKings NBA Optimizer — Persistent Slate + OUT Checkboxes + On-demand Projections")
+st.title("DraftKings NBA Optimizer — Fast Late Injuries (Precomputed Absence Profiles)")
 
 
 # ==========================
-# Helpers / DK scoring
+# Helpers
 # ==========================
 def clean_name(s: str) -> str:
     return " ".join(str(s).lower().replace(".", "").split())
@@ -90,26 +97,6 @@ def slot_eligible(pos_list: list, slot: str) -> bool:
         return len(pos) > 0
     return False
 
-def dk_fp(stats: dict) -> float:
-    pts = float(stats.get("PTS", 0))
-    reb = float(stats.get("REB", 0))
-    ast = float(stats.get("AST", 0))
-    stl = float(stats.get("STL", 0))
-    blk = float(stats.get("BLK", 0))
-    tov = float(stats.get("TOV", 0))
-    tpm = float(stats.get("FG3M", 0))
-
-    fp = pts + 1.25 * reb + 1.5 * ast + 2 * stl + 2 * blk - 0.5 * tov + 0.5 * tpm
-
-    # DK bonuses
-    cats_10 = sum([pts >= 10, reb >= 10, ast >= 10, stl >= 10, blk >= 10])
-    if cats_10 >= 2:
-        fp += 1.5
-    if cats_10 >= 3:
-        fp += 3.0
-
-    return round(fp, 2)
-
 def safe_float(x, default=np.nan):
     try:
         if x is None:
@@ -122,9 +109,39 @@ def safe_float(x, default=np.nan):
     except Exception:
         return default
 
+def dk_fp(stats: dict) -> float:
+    pts = float(stats.get("PTS", 0))
+    reb = float(stats.get("REB", 0))
+    ast = float(stats.get("AST", 0))
+    stl = float(stats.get("STL", 0))
+    blk = float(stats.get("BLK", 0))
+    tov = float(stats.get("TOV", 0))
+    tpm = float(stats.get("FG3M", 0))
+
+    fp = pts + 1.25 * reb + 1.5 * ast + 2 * stl + 2 * blk - 0.5 * tov + 0.5 * tpm
+
+    cats_10 = sum([pts >= 10, reb >= 10, ast >= 10, stl >= 10, blk >= 10])
+    if cats_10 >= 2:
+        fp += 1.5
+    if cats_10 >= 3:
+        fp += 3.0
+    return round(fp, 2)
+
+def parse_positions_cell(x):
+    if isinstance(x, list):
+        return x
+    s = str(x)
+    if s.startswith("[") and s.endswith("]"):
+        s2 = s.strip("[]").replace("'", "").replace('"', "")
+        parts = [p.strip() for p in s2.split(",") if p.strip()]
+        return parts
+    if "/" in s:
+        return dk_positions_list(s)
+    return [s.strip()] if s.strip() else []
+
 
 # ==========================
-# GitHub Gist persistence
+# Gist persistence
 # ==========================
 def _get_secret(name: str, default=None):
     try:
@@ -155,10 +172,8 @@ def gist_read_file(gist_json: dict, filename: str):
     files = gist_json.get("files", {})
     if filename not in files:
         return None
-
     if "content" in files[filename] and files[filename]["content"] is not None and not files[filename].get("truncated", False):
         return files[filename]["content"]
-
     raw_url = files[filename].get("raw_url")
     if not raw_url:
         return None
@@ -170,28 +185,24 @@ def gist_read_file(gist_json: dict, filename: str):
 # ==========================
 # NBA helpers (IDs, logs, caching)
 # ==========================
-@st.cache_data(ttl=3600)  # was 86400; reduce staleness in case player list updates
+@st.cache_data(ttl=3600)
 def player_id_map():
     plist = nba_players.get_players()
     return {clean_name(p["full_name"]): int(p["id"]) for p in plist}
 
 def get_player_id(name: str) -> int:
-    # 1) exact match
     key = clean_name(name)
     m = player_id_map()
     if key in m:
         return m[key]
 
-    # 2) full-name search
     matches = nba_players.find_players_by_full_name(name)
     if matches:
         return int(matches[0]["id"])
 
-    # 3) last-name fallback + fuzzy selection
     parts = str(name).strip().split()
     if not parts:
         raise ValueError(f"Player not found: {name}")
-
     last = parts[-1]
     last_matches = nba_players.find_players_by_last_name(last) or []
     if last_matches:
@@ -229,7 +240,7 @@ def gamelog(pid: int):
             return df, None
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
-            time.sleep((1.6 ** attempt) + random.uniform(0.3, 0.9))
+            time.sleep((1.7 ** attempt) + random.uniform(0.2, 0.7))
     return pd.DataFrame(), f"FAILED_AFTER_RETRIES ({last_err})"
 
 @st.cache_data(ttl=3600)
@@ -239,62 +250,52 @@ def team_games(team_id: int):
         return pd.DataFrame()
     return df
 
-def per_min_rates_from_games(gl: pd.DataFrame, game_ids: set):
-    if gl is None or gl.empty:
-        return None, None, 0
-
-    work = gl[gl["Game_ID"].astype(str).isin({str(x) for x in game_ids})].copy()
-    if work.empty:
-        return None, None, 0
-
-    work["MIN_float"] = work["MIN"].apply(parse_minutes)
-    work = work.dropna(subset=["MIN_float"])
-    if work.empty:
-        return None, None, 0
-
-    for c in STAT_COLS:
-        work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0)
-
-    tot_min = float(work["MIN_float"].sum())
-    if tot_min <= 0:
-        return None, None, 0
-
-    rates = {c: float(work[c].sum()) / tot_min for c in STAT_COLS}
-    avg_min = float(work["MIN_float"].mean())
-    n_games = int(work.shape[0])
-    return rates, avg_min, n_games
-
 def per_min_rates_recent(gl: pd.DataFrame, n: int):
     work = gl.head(int(n)).copy()
     work["MIN_float"] = work["MIN"].apply(parse_minutes)
     work = work.dropna(subset=["MIN_float"])
     if work.empty:
         return None, None
-
     for c in STAT_COLS:
         work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0)
-
     tot_min = float(work["MIN_float"].sum())
     if tot_min <= 0:
         return None, None
-
     rates = {c: float(work[c].sum()) / tot_min for c in STAT_COLS}
     avg_min = float(work["MIN_float"].mean())
     return rates, avg_min
 
-def project_player(name: str, last_n: int):
+def per_min_rates_from_games(gl: pd.DataFrame, game_ids: set):
+    if gl is None or gl.empty:
+        return None, None, 0
+    work = gl[gl["Game_ID"].astype(str).isin({str(x) for x in game_ids})].copy()
+    if work.empty:
+        return None, None, 0
+    work["MIN_float"] = work["MIN"].apply(parse_minutes)
+    work = work.dropna(subset=["MIN_float"])
+    if work.empty:
+        return None, None, 0
+    for c in STAT_COLS:
+        work[c] = pd.to_numeric(work[c], errors="coerce").fillna(0)
+    tot_min = float(work["MIN_float"].sum())
+    if tot_min <= 0:
+        return None, None, 0
+    rates = {c: float(work[c].sum()) / tot_min for c in STAT_COLS}
+    avg_min = float(work["MIN_float"].mean())
+    n_games = int(work.shape[0])
+    return rates, avg_min, n_games
+
+def project_player_base(name: str, last_n: int):
     pid = get_player_id(name)
     gl, err = gamelog(pid)
     if gl is None or gl.empty:
         raise RuntimeError(f"NO_GAMELOG ({err})")
-
     rates, mins = per_min_rates_recent(gl, last_n)
     if rates is None or mins is None or mins <= 0:
         raise RuntimeError("NO_MINUTES_IN_SAMPLE")
-
-    proj_stats = {c: round(float(rates[c] * mins), 2) for c in STAT_COLS}
-    fp = dk_fp(proj_stats)
-    return round(float(mins), 2), float(fp), proj_stats
+    stats = {c: round(float(rates[c] * mins), 2) for c in STAT_COLS}
+    fp = dk_fp(stats)
+    return round(float(mins), 2), float(fp), stats
 
 
 # ==========================
@@ -323,12 +324,20 @@ def read_dk_csv(uploaded_or_text) -> pd.DataFrame:
 
 
 # ==========================
-# Old bump engine (fallback)
+# Old heuristic bumps (fallback, no API calls)
 # ==========================
-def apply_old_out_bumps(full_proj_df: pd.DataFrame, only_team: str | None = None) -> pd.DataFrame:
-    df = full_proj_df.copy()
-    ok_mask = df["Status"].astype(str) == "OK"
-    out_mask = df["Status"].astype(str) == "OUT"
+def apply_old_out_bumps(df_in: pd.DataFrame, out_clean_set: set) -> pd.DataFrame:
+    df = df_in.copy()
+    if "Notes" not in df.columns:
+        df["Notes"] = ""
+    if "Name_clean" not in df.columns:
+        df["Name_clean"] = df["Name"].apply(clean_name)
+
+    df["Status"] = df["Status"].astype(str)
+    df.loc[df["Name_clean"].isin(out_clean_set), "Status"] = "OUT"
+
+    ok_mask = df["Status"] == "OK"
+    out_mask = df["Status"] == "OUT"
 
     df["BaseMinutes"] = df["Minutes"]
     for c in STAT_COLS:
@@ -339,14 +348,7 @@ def apply_old_out_bumps(full_proj_df: pd.DataFrame, only_team: str | None = None
         )
         df[f"PM_{c}"] = df[f"PM_{c}"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    if "Notes" not in df.columns:
-        df["Notes"] = ""
-
-    teams_to_process = df.loc[out_mask, "Team"].dropna().unique()
-    if only_team is not None:
-        teams_to_process = [only_team] if only_team in set(teams_to_process) else []
-
-    for team in teams_to_process:
+    for team in df.loc[out_mask, "Team"].dropna().unique():
         team_out = df[(df["Team"] == team) & out_mask].copy()
         team_ok = df[(df["Team"] == team) & ok_mask].copy()
         if team_out.empty or team_ok.empty:
@@ -367,12 +369,10 @@ def apply_old_out_bumps(full_proj_df: pd.DataFrame, only_team: str | None = None
             old_m = safe_float(df.at[idx, "Minutes"], 0.0)
             new_m = min(old_m + inc, MAX_MINUTES_PLAYER)
             df.at[idx, "Minutes"] = new_m
-
             for c in STAT_COLS:
                 df.at[idx, c] = round(safe_float(df.at[idx, f"PM_{c}"], 0.0) * new_m, 2)
-
             if inc > 0:
-                df.at[idx, "Notes"] = (str(df.at[idx, "Notes"]) + f" MIN+{inc:.1f}").strip()
+                df.at[idx, "Notes"] = (str(df.at[idx, "Notes"]) + f" HEUR_MIN+{inc:.1f}").strip()
 
         team_ok2 = df[(df["Team"] == team) & ok_mask].copy()
         team_ok2["rank"] = team_ok2["Minutes"].fillna(0) + 40.0 * team_ok2["PM_AST"].fillna(0)
@@ -388,7 +388,7 @@ def apply_old_out_bumps(full_proj_df: pd.DataFrame, only_team: str | None = None
                 df.at[idx, "PTS"] = round(safe_float(df.at[idx, "PTS"], 0.0) * mult, 2)
                 df.at[idx, "AST"] = round(safe_float(df.at[idx, "AST"], 0.0) * mult, 2)
                 df.at[idx, "FG3M"] = round(safe_float(df.at[idx, "FG3M"], 0.0) * mult, 2)
-                df.at[idx, "Notes"] = (str(df.at[idx, "Notes"]) + f" OFFx{mult:.2f}").strip()
+                df.at[idx, "Notes"] = (str(df.at[idx, "Notes"]) + f" HEUR_OFFx{mult:.2f}").strip()
 
         for idx in df.index[(df["Team"] == team) & ok_mask]:
             stats = {c: safe_float(df.at[idx, c], 0.0) for c in STAT_COLS}
@@ -400,121 +400,243 @@ def apply_old_out_bumps(full_proj_df: pd.DataFrame, only_team: str | None = None
 
 
 # ==========================
-# Season-only Historical Absence Bumps
+# Absence Profiles: precompute once (slow), apply later (fast)
 # ==========================
-@st.cache_data(ttl=21600)  # 6 hours
-def absence_game_ids_for_player(team_abbrev: str, out_player_name: str):
-    team_id = team_abbrev_to_id().get(team_abbrev.upper())
-    if not team_id:
-        return set(), 0
+def choose_out_candidates(base_df_ok: pd.DataFrame) -> pd.DataFrame:
+    # Only consider higher-minute / higher-salary slate players as potential OUT candidates
+    cand = base_df_ok.copy()
+    cand["Minutes"] = pd.to_numeric(cand["Minutes"], errors="coerce")
+    cand["Salary"] = pd.to_numeric(cand["Salary"], errors="coerce")
+    return cand[
+        (cand["Minutes"].fillna(0) >= OUT_CANDIDATE_MIN_MINUTES) |
+        (cand["Salary"].fillna(0) >= OUT_CANDIDATE_MIN_SALARY)
+    ].copy()
 
-    tg = team_games(team_id)
-    if tg is None or tg.empty or "Game_ID" not in tg.columns:
-        return set(), 0
+def build_absence_profiles(base_df: pd.DataFrame) -> dict:
+    """
+    Returns nested dict:
+    profiles[team][out_clean] = {
+        "n_games": int,
+        "teammates": {
+            teammate_clean: {"min_delta": float, "mult": float}
+        }
+    }
+    'mult' is a single capped multiplier applied to all stat categories (simple but effective).
+    """
+    profiles = {}
+    if base_df.empty:
+        return profiles
 
-    team_game_ids = set(tg["Game_ID"].astype(str).tolist())
+    base_df = base_df.copy()
+    base_df["Name_clean"] = base_df.get("Name_clean", base_df["Name"].apply(clean_name))
+    base_df["Status"] = base_df["Status"].astype(str)
 
-    pid = get_player_id(out_player_name)
-    gl, _ = gamelog(pid)
-    if gl is None or gl.empty:
-        return set(), 0
+    ok = base_df[base_df["Status"] == "OK"].copy()
+    if ok.empty:
+        return profiles
 
-    played_ids = set(gl["Game_ID"].astype(str).tolist())
-    abs_ids = team_game_ids - played_ids
-    return abs_ids, len(abs_ids)
+    out_candidates = choose_out_candidates(ok)
 
-def apply_absence_bumps(df_in: pd.DataFrame, out_clean_set: set) -> tuple[pd.DataFrame, set]:
-    df = df_in.copy()
-    if "Notes" not in df.columns:
-        df["Notes"] = ""
-    if "Name_clean" not in df.columns:
-        df["Name_clean"] = df["Name"].apply(clean_name)
+    teams = sorted(ok["Team"].dropna().unique())
+    team_map = team_abbrev_to_id()
 
-    teams_used_absence = set()
-    teams_with_out = df[df["Name_clean"].isin(out_clean_set)]["Team"].dropna().unique()
-
-    for team in teams_with_out:
-        out_rows = df[(df["Team"] == team) & (df["Name_clean"].isin(out_clean_set))].copy()
-        ok_rows = df[(df["Team"] == team) & (df["Status"] == "OK")].copy()
-        if out_rows.empty or ok_rows.empty:
+    # Precompute gamelogs are already cached from base build, so this uses cache heavily.
+    for team in teams:
+        team_id = team_map.get(team.upper())
+        if not team_id:
             continue
 
-        out_rows = out_rows.head(MAX_OUT_PLAYERS_PER_TEAM)
+        tg = team_games(team_id)
+        if tg is None or tg.empty or "Game_ID" not in tg.columns:
+            continue
 
-        baseline_pm = {}
-        for idx in ok_rows.index:
-            m = safe_float(df.at[idx, "Minutes"], np.nan)
-            if pd.notna(m) and m > 0:
-                baseline_pm[idx] = {c: safe_float(df.at[idx, c], 0.0) / m for c in STAT_COLS}
+        team_game_ids = set(tg["Game_ID"].astype(str).tolist())
+        team_ok = ok[ok["Team"] == team].copy()
+        if team_ok.empty:
+            continue
 
-        used_any_absence = False
-        cum_mult = {idx: 1.0 for idx in ok_rows.index}
-        cum_min_delta = {idx: 0.0 for idx in ok_rows.index}
-        notes_add = {idx: "" for idx in ok_rows.index}
+        team_cands = out_candidates[out_candidates["Team"] == team].copy()
+        if team_cands.empty:
+            continue
 
-        for _, outp in out_rows.iterrows():
-            out_name = str(outp["Name"])
-            abs_ids, abs_count = absence_game_ids_for_player(team, out_name)
-            if abs_count < MIN_ABSENCE_GAMES or len(abs_ids) < MIN_ABSENCE_GAMES:
-                continue
+        profiles.setdefault(team, {})
 
-            for idx in ok_rows.index:
-                teammate_name = str(df.at[idx, "Name"])
-                try:
-                    pid_tm = get_player_id(teammate_name)
+        for out_row in team_cands.itertuples(index=False):
+            out_name = str(out_row.Name)
+            out_clean = str(out_row.Name_clean)
+
+            try:
+                pid_out = get_player_id(out_name)
+                gl_out, _ = gamelog(pid_out)
+                if gl_out is None or gl_out.empty:
+                    continue
+
+                played_ids = set(gl_out["Game_ID"].astype(str).tolist())
+                abs_ids = team_game_ids - played_ids
+                if len(abs_ids) < MIN_ABSENCE_GAMES:
+                    continue
+
+                # Baseline per-minute from BASE projections
+                # Baseline rates = projected stat / projected minutes (using base model)
+                base_rates = {}
+                for tm in team_ok.itertuples(index=False):
+                    m = safe_float(tm.Minutes, np.nan)
+                    if pd.isna(m) or m <= 0:
+                        continue
+                    base_rates[str(tm.Name_clean)] = {
+                        "min": float(m),
+                        "pm": {
+                            "PTS": safe_float(tm.PTS, 0.0) / float(m),
+                            "REB": safe_float(tm.REB, 0.0) / float(m),
+                            "AST": safe_float(tm.AST, 0.0) / float(m),
+                            "STL": safe_float(tm.STL, 0.0) / float(m),
+                            "BLK": safe_float(tm.BLK, 0.0) / float(m),
+                            "TOV": safe_float(tm.TOV, 0.0) / float(m),
+                            "FG3M": safe_float(tm.FG3M, 0.0) / float(m),
+                        }
+                    }
+
+                teammates_dict = {}
+                used_any = False
+
+                for tm in team_ok.itertuples(index=False):
+                    tm_name = str(tm.Name)
+                    tm_clean = str(tm.Name_clean)
+                    if tm_clean not in base_rates:
+                        continue
+
+                    pid_tm = get_player_id(tm_name)
                     gl_tm, _ = gamelog(pid_tm)
                     rates_off, min_off, n_games = per_min_rates_from_games(gl_tm, abs_ids)
+
                     if rates_off is None or min_off is None or n_games < MIN_ABSENCE_GAMES:
                         continue
 
-                    base_min = safe_float(df.at[idx, "Minutes"], 0.0)
+                    base_min = base_rates[tm_clean]["min"]
                     dmin = float(min_off) - float(base_min)
                     dmin = max(ABS_MIN_DELTA_FLOOR, min(ABS_MIN_DELTA_CAP, dmin))
-                    cum_min_delta[idx] += dmin
 
-                    for c in STAT_COLS:
-                        base_rate = baseline_pm.get(idx, {}).get(c, None)
-                        if base_rate is None or base_rate <= 0:
-                            continue
-                        off_rate = float(rates_off.get(c, 0.0))
-                        if off_rate <= 0:
-                            continue
-                        mult = off_rate / base_rate
-                        mult = max(ABS_STAT_MULT_MIN, min(ABS_STAT_MULT_MAX, mult))
-                        cum_mult[idx] = min(ABS_STACK_MULT_MAX, cum_mult[idx] * mult)
+                    # Create a single multiplier based on 3 main categories (PTS/AST/REB),
+                    # so it behaves well even with small sample noise.
+                    mults = []
+                    for c in ["PTS", "AST", "REB", "FG3M"]:
+                        base_pm = base_rates[tm_clean]["pm"].get(c, 0.0)
+                        off_pm = float(rates_off.get(c, 0.0))
+                        if base_pm > 0 and off_pm > 0:
+                            mults.append(off_pm / base_pm)
 
-                    notes_add[idx] += f" {out_name.split(' ')[-1]}OFF({abs_count})"
-                    used_any_absence = True
-                except Exception:
-                    continue
+                    if len(mults) == 0:
+                        continue
 
-        if not used_any_absence:
+                    raw_mult = float(np.median(mults))
+                    mult = max(ABS_STAT_MULT_MIN, min(ABS_STAT_MULT_MAX, raw_mult))
+
+                    teammates_dict[tm_clean] = {
+                        "min_delta": round(float(dmin), 3),
+                        "mult": round(float(mult), 4),
+                    }
+                    used_any = True
+
+                if used_any:
+                    profiles[team][out_clean] = {
+                        "n_games": int(len(abs_ids)),
+                        "teammates": teammates_dict
+                    }
+
+            except Exception:
+                continue
+
+    return profiles
+
+def apply_absence_profiles_fast(base_df_in: pd.DataFrame, out_clean_set: set, profiles: dict) -> tuple[pd.DataFrame, set]:
+    """
+    Apply precomputed absence profiles with NO NBA calls.
+    Returns (df_after, teams_with_profile_used).
+    """
+    df = base_df_in.copy()
+    if "Notes" not in df.columns:
+        df["Notes"] = ""
+    df["Name_clean"] = df.get("Name_clean", df["Name"].apply(clean_name))
+    df["Status"] = df["Status"].astype(str)
+
+    # mark OUT based on checkboxes
+    df.loc[df["Name_clean"].isin(out_clean_set), "Status"] = "OUT"
+
+    teams_used = set()
+
+    # baseline per-minute from base df (before bumps)
+    df["BaseMinutes"] = pd.to_numeric(df["Minutes"], errors="coerce")
+    for c in STAT_COLS:
+        df[f"PM_{c}"] = np.where(
+            df["BaseMinutes"].fillna(0) > 0,
+            pd.to_numeric(df[c], errors="coerce").fillna(0) / df["BaseMinutes"].replace(0, np.nan),
+            0.0
+        )
+        df[f"PM_{c}"] = df[f"PM_{c}"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # for each team, apply up to MAX_OUT_PLAYERS_PER_TEAM profiles
+    out_rows = df[df["Status"] == "OUT"][["Team", "Name_clean", "Name"]].copy()
+    for team in out_rows["Team"].dropna().unique():
+        if team not in profiles:
             continue
 
-        teams_used_absence.add(team)
+        outs_team = out_rows[out_rows["Team"] == team].head(MAX_OUT_PLAYERS_PER_TEAM)
+        if outs_team.empty:
+            continue
 
-        for idx in ok_rows.index:
-            base_min = safe_float(df.at[idx, "Minutes"], 0.0)
-            new_min = base_min + cum_min_delta.get(idx, 0.0)
+        ok_idx = df.index[(df["Team"] == team) & (df["Status"] == "OK")].tolist()
+        if not ok_idx:
+            continue
+
+        # initialize stacking
+        cum_min_delta = {idx: 0.0 for idx in ok_idx}
+        cum_mult = {idx: 1.0 for idx in ok_idx}
+        used_any_profile = False
+
+        for outp in outs_team.itertuples(index=False):
+            out_clean = str(outp.Name_clean)
+            prof = profiles.get(team, {}).get(out_clean)
+            if not prof:
+                continue
+
+            teammates = prof.get("teammates", {})
+            for idx in ok_idx:
+                tm_clean = str(df.at[idx, "Name_clean"])
+                if tm_clean not in teammates:
+                    continue
+
+                dmin = float(teammates[tm_clean].get("min_delta", 0.0))
+                mult = float(teammates[tm_clean].get("mult", 1.0))
+
+                cum_min_delta[idx] += dmin
+                cum_mult[idx] = min(ABS_STACK_MULT_MAX, cum_mult[idx] * mult)
+                used_any_profile = True
+
+        if not used_any_profile:
+            continue
+
+        teams_used.add(team)
+
+        # apply
+        for idx in ok_idx:
+            base_min = safe_float(df.at[idx, "BaseMinutes"], 0.0)
+            new_min = base_min + cum_min_delta[idx]
             new_min = max(0.0, min(MAX_MINUTES_PLAYER, new_min))
-            df.at[idx, "Minutes"] = round(new_min, 2)
+            df.at[idx, "Minutes"] = round(float(new_min), 2)
 
-            m = cum_mult.get(idx, 1.0)
-            if base_min > 0:
-                for c in STAT_COLS:
-                    base_rate = safe_float(df.at[idx, c], 0.0) / base_min
-                    df.at[idx, c] = round(base_rate * m * new_min, 2)
+            m = float(cum_mult[idx])
+            for c in STAT_COLS:
+                pm = safe_float(df.at[idx, f"PM_{c}"], 0.0)
+                df.at[idx, c] = round(float(pm) * m * float(new_min), 2)
 
-            extra = notes_add.get(idx, "").strip()
-            if extra:
-                df.at[idx, "Notes"] = (str(df.at[idx, "Notes"]) + f" ABS:{extra}").strip()
+            df.at[idx, "Notes"] = (str(df.at[idx, "Notes"]) + f" ABSx{m:.2f}").strip()
 
             stats = {c: safe_float(df.at[idx, c], 0.0) for c in STAT_COLS}
             df.at[idx, "DK_FP"] = dk_fp(stats)
             sal = safe_float(df.at[idx, "Salary"], 0.0)
             df.at[idx, "Value"] = (df.at[idx, "DK_FP"] / (sal / 1000.0)) if sal > 0 else np.nan
 
-    return df, teams_used_absence
+    return df, teams_used
 
 
 # ==========================
@@ -522,7 +644,6 @@ def apply_absence_bumps(df_in: pd.DataFrame, out_clean_set: set) -> tuple[pd.Dat
 # ==========================
 def optimize(pool_df: pd.DataFrame) -> pd.DataFrame:
     prob = LpProblem("DK_NBA_CLASSIC", LpMaximize)
-
     rows = pool_df.to_dict("records")
     n = len(rows)
     if n == 0:
@@ -543,7 +664,6 @@ def optimize(pool_df: pd.DataFrame) -> pd.DataFrame:
         prob += lpSum(x[(i, slot)] for slot in DK_SLOTS if (i, slot) in x) <= 1
 
     prob += lpSum(rows[i]["Salary"] * x[(i, slot)] for (i, slot) in x) <= DK_SALARY_CAP
-
     prob.solve(PULP_CBC_CMD(msg=False))
 
     lineup_rows = []
@@ -554,7 +674,7 @@ def optimize(pool_df: pd.DataFrame) -> pd.DataFrame:
                 chosen_i = i
                 break
         if chosen_i is None:
-            raise ValueError("No feasible lineup found. (Pool too small / position constraints.)")
+            raise ValueError("No feasible lineup found (pool too small / slot constraints).")
 
         r = rows[chosen_i]
         lineup_rows.append({
@@ -575,36 +695,33 @@ def optimize(pool_df: pd.DataFrame) -> pd.DataFrame:
             "Value": r["Value"],
             "Notes": r.get("Notes", ""),
         })
-
     return pd.DataFrame(lineup_rows)
 
 
 # ==========================
-# Required secrets
+# Secrets check
 # ==========================
 if not (GITHUB_TOKEN and GIST_ID):
-    st.error("Missing Streamlit Secrets. Add GITHUB_TOKEN and GIST_ID in Streamlit Cloud → Settings → Secrets.")
+    st.error("Missing secrets. Add GITHUB_TOKEN and GIST_ID in Streamlit Cloud → Settings → Secrets.")
     st.stop()
 
 
 # ==========================
-# Sidebar controls
+# Sidebar
 # ==========================
-uploaded = st.sidebar.file_uploader("Upload DraftKings CSV (saves for phone too)", type="csv")
+uploaded = st.sidebar.file_uploader("Upload DraftKings CSV (saved for phone too)", type="csv")
 last_n = st.sidebar.number_input("Recent games window (N)", 1, 30, int(st.session_state.get("last_n", DEFAULT_LAST_N)))
 st.session_state["last_n"] = int(last_n)
 
-st.sidebar.caption("Bumps:")
-use_absence_bumps = st.sidebar.checkbox("Use season-only historical absence bumps (recommended)", value=True)
-use_fallback_bumps = st.sidebar.checkbox("Fallback bumps (minutes redistribution)", value=True)
+use_absence_profiles = st.sidebar.checkbox("Use Absence Profiles (season-only, precomputed)", value=True)
+use_fallback_bumps = st.sidebar.checkbox("Fallback Heuristic bumps if no profile", value=True)
+show_debug = st.sidebar.checkbox("Show debug tables", value=True)
 
-show_debug = st.sidebar.checkbox("Show debug tables (missing players, errors)", value=True)
-
-reload_btn = st.sidebar.button("Reload saved slate/projections")
+reload_btn = st.sidebar.button("Reload saved slate/base/profiles/final")
 
 
 # ==========================
-# Load from gist (or upload overrides)
+# Load gist
 # ==========================
 gist_json = gist_get(GIST_ID) if (reload_btn or "gist_json" not in st.session_state) else st.session_state["gist_json"]
 st.session_state["gist_json"] = gist_json
@@ -615,16 +732,18 @@ if uploaded is not None:
         GIST_FILE_SLATE: csv_text,
         GIST_FILE_META: json.dumps({"season": SEASON, "saved_at": time.time()}, indent=2),
     })
-    st.sidebar.success("Saved slate. Open on phone and it will load the same slate.")
+    st.sidebar.success("Saved slate.")
     slate_df = read_dk_csv(csv_text)
 else:
     slate_text = gist_read_file(gist_json, GIST_FILE_SLATE)
     if not slate_text:
-        st.info("Upload a DK CSV in the sidebar to begin.")
+        st.info("Upload a DK CSV to begin.")
         st.stop()
     slate_df = read_dk_csv(slate_text)
 
-proj_text = gist_read_file(gist_json, GIST_FILE_PROJ)
+base_text = gist_read_file(gist_json, GIST_FILE_BASE)
+abs_text = gist_read_file(gist_json, GIST_FILE_ABS)
+final_text = gist_read_file(gist_json, GIST_FILE_FINAL)
 
 out_flags_text = gist_read_file(gist_json, GIST_FILE_OUT)
 saved_out_flags = {}
@@ -634,12 +753,15 @@ if out_flags_text:
     except Exception:
         saved_out_flags = {}
 
-# Build checkbox table
+
+# ==========================
+# OUT checkboxes
+# ==========================
 slate_view = slate_df.copy()
 slate_view["OUT"] = slate_view["Name_clean"].map(lambda k: bool(saved_out_flags.get(k, False)))
 
 st.write(f"**Season:** {SEASON}  |  **Cap:** ${DK_SALARY_CAP:,}  |  **Slots:** {', '.join(DK_SLOTS)}")
-st.subheader("Step 1 — Mark OUT players (checkbox). Projections only run when you click Run Projections.")
+st.subheader("Step 1 — Mark OUT players (checkbox).")
 
 edited = st.data_editor(
     slate_view[["OUT", "Name", "Team", "Positions", "Salary", "GameInfo"]],
@@ -649,7 +771,6 @@ edited = st.data_editor(
     disabled=["Name", "Team", "Positions", "Salary", "GameInfo"],
 )
 
-# Live OUT set from checkboxes
 name_to_clean = dict(zip(slate_view["Name"], slate_view["Name_clean"]))
 live_flags = {}
 for _, row in edited.iterrows():
@@ -658,39 +779,35 @@ for _, row in edited.iterrows():
     live_flags[cl] = bool(row["OUT"])
 out_clean_set = {k for k, v in live_flags.items() if v}
 
-# Show last saved projections (no recompute)
-if proj_text:
-    try:
-        last_proj = pd.read_csv(StringIO(proj_text))
-        st.subheader("Last Saved Projections (no recompute)")
-        st.dataframe(last_proj.rename(columns={"FG3M": "3PM"}), use_container_width=True, hide_index=True)
-    except Exception:
-        pass
+colA, colB = st.columns(2)
+with colA:
+    if st.button("Save OUT selections"):
+        gist_update_files(GIST_ID, {GIST_FILE_OUT: json.dumps(live_flags, indent=2)})
+        st.success("Saved OUT selections.")
+with colB:
+    st.caption("Tip: after late injuries, you’ll click Step B (fast).")
 
+
+# ==========================
+# Step A (slow): Build Base + Profiles
+# ==========================
 st.divider()
-st.subheader("Step 2 — Run projections (only when you click)")
+st.subheader("Step A (slow) — Build BASE projections + Absence Profiles (run once per slate)")
 
-run_proj = st.button("Run Projections (apply OUT bumps, remove OUT, save results)")
-latest_display_df = None
+rebuild_base = st.button("Build BASE + Absence Profiles (slow)")
+retry_err = st.button("Retry ERR players only (slow)")
 
-if run_proj:
-    # Persist OUT selections automatically on projection run (phone + desktop sync)
-    gist_update_files(GIST_ID, {GIST_FILE_OUT: json.dumps(live_flags, indent=2)})
-
+if rebuild_base:
     rows = []
     total = len(slate_df)
-    progress = st.progress(0, text="Starting projections...")
+    prog = st.progress(0, text="Starting BASE projections...")
 
     for i, r in enumerate(slate_df.itertuples(index=False), start=1):
-        progress.progress(int(i / max(total, 1) * 100), text=f"Running gamelog({r.Name}) ({i}/{total})")
-
-        status = "OUT" if r.Name_clean in out_clean_set else "OK"
-
+        prog.progress(int(i / max(total, 1) * 100), text=f"Running gamelog({r.Name}) ({i}/{total})")
         try:
-            mins, fp, stats = project_player(r.Name, st.session_state["last_n"])
+            mins, fp, stats = project_player_base(r.Name, st.session_state["last_n"])
             sal = safe_float(r.Salary, np.nan)
             value = (fp / (sal / 1000.0)) if (pd.notna(sal) and sal > 0) else np.nan
-
             rows.append({
                 "Name": r.Name,
                 "Name_clean": r.Name_clean,
@@ -707,7 +824,7 @@ if run_proj:
                 "TOV": stats["TOV"],
                 "DK_FP": fp,
                 "Value": value,
-                "Status": status,
+                "Status": "OK",
                 "Notes": "",
             })
         except Exception as e:
@@ -721,124 +838,177 @@ if run_proj:
                 "PTS": np.nan, "REB": np.nan, "AST": np.nan, "FG3M": np.nan, "STL": np.nan, "BLK": np.nan, "TOV": np.nan,
                 "DK_FP": np.nan,
                 "Value": np.nan,
-                "Status": f"ERR: {str(e)[:90]}",
+                "Status": f"ERR: {str(e)[:120]}",
                 "Notes": "",
             })
-
         time.sleep(BUILD_THROTTLE_SECONDS)
 
-    progress.empty()
-    full_proj_df = pd.DataFrame(rows)
+    prog.empty()
+    base_df = pd.DataFrame(rows)
 
-    # Apply bumps using OUT players in background
-    teams_used_absence = set()
-    if out_clean_set:
-        if use_absence_bumps:
-            try:
-                full_proj_df, teams_used_absence = apply_absence_bumps(full_proj_df, out_clean_set)
-            except Exception:
-                teams_used_absence = set()
-
-        if use_fallback_bumps:
-            for t in full_proj_df[(full_proj_df["Status"] == "OUT")]["Team"].dropna().unique():
-                if t not in teams_used_absence:
-                    full_proj_df = apply_old_out_bumps(full_proj_df, only_team=t)
-
-    # DEBUG: show why players "disappear"
-    if show_debug:
-        st.subheader("Status counts (debug)")
-        st.write(full_proj_df["Status"].value_counts(dropna=False))
-
-        with st.expander("Show non-OK rows (ERR / OUT)"):
-            st.dataframe(
-                full_proj_df[full_proj_df["Status"] != "OK"].sort_values(["Team", "Status"]),
-                use_container_width=True,
-                hide_index=True
-            )
-
-        with st.expander("Search a player in FULL results (debug)"):
-            search_name = st.text_input("Type a player name to find (debug)", "")
-            if search_name.strip():
-                key = clean_name(search_name)
-                hits = full_proj_df[full_proj_df["Name_clean"].str.contains(key, na=False)]
-                st.dataframe(hits, use_container_width=True, hide_index=True)
-
-    # OUT removal
-    if "Name_clean" not in full_proj_df.columns:
-        full_proj_df["Name_clean"] = full_proj_df["Name"].apply(clean_name)
-
-    proj_df = full_proj_df[
-        (full_proj_df["Status"] == "OK") &
-        (~full_proj_df["Name_clean"].isin(out_clean_set))
-    ].copy()
-
-    display_df = proj_df.copy().sort_values("DK_FP", ascending=False)
+    st.info("Building Absence Profiles (season-only) — this is the part that makes late injuries fast.")
+    prof_prog = st.progress(0, text="Building absence profiles...")
+    try:
+        ok_df = base_df[base_df["Status"] == "OK"].copy()
+        # small progress estimate: number of teams
+        teams = sorted(ok_df["Team"].dropna().unique())
+        profiles = build_absence_profiles(base_df)
+        prof_prog.progress(100, text="Absence profiles complete.")
+    except Exception:
+        profiles = {}
+        prof_prog.progress(100, text="Absence profiles failed; will rely on fallback bumps.")
+    time.sleep(0.2)
+    prof_prog.empty()
 
     gist_update_files(GIST_ID, {
-        GIST_FILE_PROJ: display_df.to_csv(index=False),
+        GIST_FILE_BASE: base_df.to_csv(index=False),
+        GIST_FILE_ABS: json.dumps(profiles),
         GIST_FILE_META: json.dumps(
-            {
-                "season": SEASON,
-                "saved_at": time.time(),
-                "last_n": int(st.session_state["last_n"]),
-                "absence_bumps": bool(use_absence_bumps),
-            },
+            {"season": SEASON, "saved_at": time.time(), "last_n": int(st.session_state["last_n"]), "built": "base+profiles"},
             indent=2
         ),
     })
 
-    st.success("Projections complete and saved. Phone/desktop will show these without re-running.")
-    st.subheader("Projections (OUT removed, bumps applied)")
-    st.dataframe(display_df.rename(columns={"FG3M": "3PM"}), use_container_width=True, hide_index=True)
+    st.success("Saved BASE projections + Absence Profiles. Late injuries should be fast now.")
+    st.write(base_df["Status"].value_counts(dropna=False))
+    if show_debug:
+        st.dataframe(base_df, use_container_width=True, hide_index=True)
 
-    latest_display_df = display_df
+if retry_err:
+    if not base_text:
+        st.error("No BASE saved yet. Run Step A first.")
+    else:
+        base_df = pd.read_csv(StringIO(base_text))
+        base_df["Positions"] = base_df["Positions"].apply(parse_positions_cell)
 
+        err_mask = base_df["Status"].astype(str).str.startswith("ERR:")
+        err_rows = base_df[err_mask].copy()
+
+        st.write(f"Retrying {len(err_rows)} ERR players...")
+        prog = st.progress(0, text="Retrying ERR players...")
+
+        for j, row in enumerate(err_rows.itertuples(index=True), start=1):
+            prog.progress(int(j / max(len(err_rows), 1) * 100), text=f"Retry gamelog({row.Name}) ({j}/{len(err_rows)})")
+            try:
+                mins, fp, stats = project_player_base(row.Name, st.session_state["last_n"])
+                sal = safe_float(row.Salary, np.nan)
+                value = (fp / (sal / 1000.0)) if (pd.notna(sal) and sal > 0) else np.nan
+
+                base_df.at[row.Index, "Minutes"] = mins
+                base_df.at[row.Index, "PTS"] = stats["PTS"]
+                base_df.at[row.Index, "REB"] = stats["REB"]
+                base_df.at[row.Index, "AST"] = stats["AST"]
+                base_df.at[row.Index, "FG3M"] = stats["FG3M"]
+                base_df.at[row.Index, "STL"] = stats["STL"]
+                base_df.at[row.Index, "BLK"] = stats["BLK"]
+                base_df.at[row.Index, "TOV"] = stats["TOV"]
+                base_df.at[row.Index, "DK_FP"] = fp
+                base_df.at[row.Index, "Value"] = value
+                base_df.at[row.Index, "Status"] = "OK"
+                base_df.at[row.Index, "Notes"] = ""
+            except Exception as e:
+                base_df.at[row.Index, "Status"] = f"ERR: {str(e)[:120]}"
+
+            time.sleep(BUILD_THROTTLE_SECONDS)
+
+        prog.empty()
+        gist_update_files(GIST_ID, {GIST_FILE_BASE: base_df.to_csv(index=False)})
+        st.success("Updated BASE projections (ERR retries).")
+        st.write(base_df["Status"].value_counts(dropna=False))
+
+
+# ==========================
+# Step B (fast): Apply OUT using profiles + fallback
+# ==========================
 st.divider()
-st.subheader("Optimizer (uses saved projections)")
+st.subheader("Step B (fast) — Apply OUT bumps + Save FINAL (no NBA calls)")
 
-# Load projections for optimizer
-pool_df = None
-if latest_display_df is not None:
-    pool_df = latest_display_df.copy()
-else:
-    if proj_text:
+apply_out_fast = st.button("Apply OUT bumps + Save FINAL (fast)")
+
+if apply_out_fast:
+    if not base_text:
+        st.error("No BASE saved yet. Run Step A first.")
+        st.stop()
+
+    gist_update_files(GIST_ID, {GIST_FILE_OUT: json.dumps(live_flags, indent=2)})
+
+    base_df = pd.read_csv(StringIO(base_text))
+    base_df["Positions"] = base_df["Positions"].apply(parse_positions_cell)
+    base_df["Name_clean"] = base_df.get("Name_clean", base_df["Name"].apply(clean_name))
+    base_df["Status"] = base_df["Status"].astype(str)
+
+    profiles = {}
+    if abs_text:
         try:
-            pool_df = pd.read_csv(StringIO(proj_text))
+            profiles = json.loads(abs_text)
         except Exception:
-            pool_df = None
+            profiles = {}
 
-if pool_df is None or pool_df.empty:
-    st.info("No projections saved yet. Run projections first.")
+    work = base_df.copy()
+
+    teams_used = set()
+    if use_absence_profiles and out_clean_set and profiles:
+        try:
+            work, teams_used = apply_absence_profiles_fast(work, out_clean_set, profiles)
+        except Exception:
+            teams_used = set()
+
+    # Fallback heuristic bumps for teams where absence profiles didn't apply
+    if use_fallback_bumps and out_clean_set:
+        # Determine teams with OUT but not used by profiles
+        work["Name_clean"] = work.get("Name_clean", work["Name"].apply(clean_name))
+        work["Status"] = work["Status"].astype(str)
+        out_teams = work[work["Name_clean"].isin(out_clean_set)]["Team"].dropna().unique()
+        for t in out_teams:
+            if t not in teams_used:
+                work = apply_old_out_bumps(work, out_clean_set)
+
+    # FINAL display: OK and not OUT
+    work["Name_clean"] = work.get("Name_clean", work["Name"].apply(clean_name))
+    final_df = work[(work["Status"] == "OK") & (~work["Name_clean"].isin(out_clean_set))].copy()
+    final_df = final_df.sort_values("DK_FP", ascending=False)
+
+    gist_update_files(GIST_ID, {
+        GIST_FILE_FINAL: final_df.to_csv(index=False),
+        GIST_FILE_META: json.dumps(
+            {"season": SEASON, "saved_at": time.time(), "last_n": int(st.session_state["last_n"]), "built": "final_fast"},
+            indent=2
+        ),
+    })
+
+    st.success("Saved FINAL projections (fast).")
+    st.dataframe(final_df.rename(columns={"FG3M": "3PM"}), use_container_width=True, hide_index=True)
+
+    if show_debug:
+        st.subheader("Debug: Who was OUT / ERR?")
+        st.write(work["Status"].value_counts(dropna=False))
+        with st.expander("Non-OK rows (debug)"):
+            st.dataframe(work[work["Status"] != "OK"], use_container_width=True, hide_index=True)
+
+
+# ==========================
+# Optimizer
+# ==========================
+st.divider()
+st.subheader("Optimizer (uses FINAL projections)")
+
+final_text = gist_read_file(gist_json, GIST_FILE_FINAL)
+if not final_text:
+    st.info("No FINAL projections yet. Run Step A then Step B.")
     st.stop()
 
-# Fix: older saved files might have 3PM
+pool_df = pd.read_csv(StringIO(final_text))
+pool_df["Positions"] = pool_df["Positions"].apply(parse_positions_cell)
+
 if "FG3M" not in pool_df.columns and "3PM" in pool_df.columns:
     pool_df["FG3M"] = pool_df["3PM"]
 
-# Restore Positions to list after CSV reload
-def parse_positions_cell(x):
-    if isinstance(x, list):
-        return x
-    s = str(x)
-    if s.startswith("[") and s.endswith("]"):
-        s2 = s.strip("[]").replace("'", "").replace('"', "")
-        parts = [p.strip() for p in s2.split(",") if p.strip()]
-        return parts
-    if "/" in s:
-        return dk_positions_list(s)
-    return [s.strip()] if s.strip() else []
-
-pool_df["Positions"] = pool_df["Positions"].apply(parse_positions_cell)
-
-run_opt = st.button("Optimize Lineup (Classic)")
-if run_opt:
-    p = pool_df.copy()
-    p = p.dropna(subset=["Salary", "DK_FP"]).copy()
+if st.button("Optimize Lineup (Classic)"):
+    p = pool_df.dropna(subset=["Salary", "DK_FP"]).copy()
     p = p[p["Salary"] > 0].copy()
 
     try:
         lineup = optimize(p)
-
         st.subheader("Optimized Lineup")
         st.dataframe(lineup, use_container_width=True, hide_index=True)
         st.metric("Total Salary", int(lineup["Salary"].sum()))
