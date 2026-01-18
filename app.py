@@ -1,6 +1,6 @@
 # ==========================
 # DraftKings NBA Optimizer
-# FAST + RECENCY BLEND (Top N salaries)
+# FAST + Recency (Top Salaries) + Manual Hashtag DvP Upload
 # ==========================
 
 import json
@@ -15,10 +15,7 @@ import streamlit as st
 import requests
 
 from pulp import LpProblem, LpMaximize, LpVariable, lpSum, LpBinary, PULP_CBC_CMD
-
-from nba_api.stats.endpoints import leaguedashplayerstats
-from nba_api.stats.endpoints import playergamelog
-from nba_api.stats.static import players as nba_players
+from nba_api.stats.endpoints import leaguedashplayerstats, playergamelog
 
 
 # ==========================
@@ -40,12 +37,17 @@ GAMELOG_RETRIES = 2
 MAX_MINUTES = 40
 BENCH_FLOOR = 6
 
-# Blend weights
+# Recency blend weights
 MIN_REC_W = 0.70      # minutes: favor recent
-PM_REC_W = 0.30       # per-minute: favor season
+PM_REC_W = 0.30       # per-minute: mostly season
+
+# Opponent DvP caps (keep realistic)
+DVP_CAP_LOW = 0.92
+DVP_CAP_HIGH = 1.08
 
 # Gist files
 GIST_SLATE = "slate.csv"
+GIST_DVP = "dvp.csv"
 GIST_OUT = "out.json"
 GIST_BASE = "base.csv"
 GIST_FINAL = "final.csv"
@@ -54,7 +56,7 @@ GIST_FINAL = "final.csv"
 # PAGE
 # ==========================
 st.set_page_config(layout="wide")
-st.title("DraftKings NBA Optimizer — FAST + Recency (Top Salaries)")
+st.title("DraftKings NBA Optimizer — Fast + Recency + Manual DvP")
 
 # ==========================
 # HELPERS
@@ -81,6 +83,13 @@ def strip_suffix(name: str) -> str:
 
 def parse_positions(p):
     return [x.strip().upper() for x in str(p).split("/") if x.strip()]
+
+def primary_pos(pos_list):
+    # pick a consistent "primary" for DvP lookup
+    # DK uses multi-position; we just take the first listed
+    if not pos_list:
+        return None
+    return str(pos_list[0]).upper()
 
 def eligible_for_slot(pos_list, slot):
     pos = set(pos_list or [])
@@ -112,12 +121,49 @@ def dk_fp(r):
     return round(fp, 2)
 
 def parse_minutes_min(x):
-    # PlayerGameLog MIN usually "34" or "34:12"
     s = str(x)
     if ":" not in s:
         return float(s)
     m, sec = s.split(":")
     return float(m) + float(sec) / 60
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+# DK "Game Info": "LAL@BOS 07:30PM ET"
+def parse_opponent_from_gameinfo(team_abbrev: str, game_info: str):
+    if not isinstance(game_info, str):
+        return None
+    gi = game_info.strip().upper()
+    if "@" not in gi:
+        return None
+    head = gi.split()[0]  # LAL@BOS
+    if "@" not in head:
+        return None
+    away, home = head.split("@", 1)
+    if team_abbrev == away:
+        return home
+    if team_abbrev == home:
+        return away
+    return None
+
+def find_col(df, candidates):
+    cols = {c.lower().strip(): c for c in df.columns}
+    for cand in candidates:
+        key = cand.lower().strip()
+        if key in cols:
+            return cols[key]
+    # fuzzy
+    best = None
+    best_score = 0
+    for c in df.columns:
+        cl = c.lower().strip()
+        for cand in candidates:
+            score = difflib.SequenceMatcher(None, cl, cand.lower().strip()).ratio()
+            if score > best_score:
+                best_score = score
+                best = c
+    return best
 
 # ==========================
 # GIST
@@ -150,10 +196,10 @@ def gist_write(files):
     r.raise_for_status()
 
 # ==========================
-# NBA DATA
+# NBA
 # ==========================
 @st.cache_data(ttl=900)
-def league_stats_df():
+def league_player_df():
     df = leaguedashplayerstats.LeagueDashPlayerStats(
         season=SEASON,
         per_mode_detailed="PerGame",
@@ -167,13 +213,7 @@ def league_stats_df():
     df["NBA_Name_clean"] = df["NBA_Name"].apply(clean_name)
     df["NBA_Name_stripped"] = df["NBA_Name"].apply(strip_suffix)
     df["NBA_Last"] = df["NBA_Name_clean"].apply(lambda x: x.split()[-1] if isinstance(x, str) and x.split() else "")
-
     return df
-
-@st.cache_data(ttl=3600)
-def static_player_map():
-    # Used only if you need to resolve IDs from names (fallback)
-    return {clean_name(p["full_name"]): int(p["id"]) for p in nba_players.get_players()}
 
 def match_player_to_nba(slate_name, nba_df):
     cn = clean_name(slate_name)
@@ -200,7 +240,6 @@ def match_player_to_nba(slate_name, nba_df):
             if best_row is not None and best_score >= 0.75:
                 return best_row
 
-    # tight fuzzy fallback
     candidates = nba_df["NBA_Name_clean"].tolist()
     hit = difflib.get_close_matches(cn, candidates, n=1, cutoff=0.90)
     if hit:
@@ -228,28 +267,51 @@ def gamelog_recent(pid: int, last_n: int):
             return rec_min, rec_rates
         except Exception as e:
             last_err = str(e)
-            time.sleep(0.5 * attempt)
+            time.sleep(0.4 * attempt)
     raise RuntimeError(f"RECENT_GAMELOG_FAIL: {last_err}")
+
+# ==========================
+# UPLOADS
+# ==========================
+st.sidebar.subheader("Uploads")
+
+# DK slate upload (saved)
+upload_slate = st.sidebar.file_uploader("Upload DK Slate CSV", type="csv")
+if upload_slate:
+    slate_text = upload_slate.getvalue().decode("utf-8", errors="ignore")
+    gist_write({GIST_SLATE: slate_text})
+else:
+    slate_text = gist_read(GIST_SLATE)
+    if not slate_text:
+        st.info("Upload DK Slate CSV in sidebar to begin.")
+        st.stop()
+
+# DVP upload (saved)
+upload_dvp = st.sidebar.file_uploader("Upload Hashtag DvP CSV", type="csv")
+if upload_dvp:
+    dvp_text = upload_dvp.getvalue().decode("utf-8", errors="ignore")
+    gist_write({GIST_DVP: dvp_text})
+else:
+    dvp_text = gist_read(GIST_DVP)
+    if not dvp_text:
+        st.warning("Upload Hashtag DvP CSV (bottom table) to apply opponent adjustments.")
+        dvp_text = None
 
 # ==========================
 # LOAD SLATE
 # ==========================
-upload = st.sidebar.file_uploader("Upload DK CSV", type="csv")
-if upload:
-    text = upload.getvalue().decode("utf-8", errors="ignore")
-    gist_write({GIST_SLATE: text})
-else:
-    text = gist_read(GIST_SLATE)
-    if not text:
-        st.info("Upload a DraftKings CSV to begin.")
-        st.stop()
-
-df = pd.read_csv(StringIO(text))
+df = pd.read_csv(StringIO(slate_text))
 required_cols = ["Name", "Salary", "TeamAbbrev", "Position"]
 missing_cols = [c for c in required_cols if c not in df.columns]
 if missing_cols:
     st.error(f"DK CSV missing columns: {missing_cols}")
     st.stop()
+
+game_info_col = None
+for cand in ["Game Info", "GameInfo", "Game_Info", "Game"]:
+    if cand in df.columns:
+        game_info_col = cand
+        break
 
 slate = pd.DataFrame({
     "Name": df["Name"].astype(str),
@@ -258,6 +320,14 @@ slate = pd.DataFrame({
     "Positions": df["Position"].astype(str).apply(parse_positions),
 })
 slate["Name_clean"] = slate["Name"].apply(clean_name)
+slate["PrimaryPos"] = slate["Positions"].apply(primary_pos)
+
+if game_info_col:
+    slate["GameInfo"] = df[game_info_col].astype(str)
+else:
+    slate["GameInfo"] = ""
+
+slate["Opp"] = slate.apply(lambda r: parse_opponent_from_gameinfo(r["Team"], r["GameInfo"]), axis=1)
 
 # ==========================
 # OUT CHECKBOXES
@@ -271,9 +341,9 @@ slate["OUT"] = slate["Name_clean"].map(lambda x: bool(saved_out.get(x, False)))
 
 st.subheader("Step 1 — Mark OUT players")
 edited = st.data_editor(
-    slate[["OUT", "Name", "Team", "Salary", "Positions"]],
+    slate[["OUT", "Name", "Team", "Opp", "PrimaryPos", "Salary", "Positions"]],
     column_config={"OUT": st.column_config.CheckboxColumn("OUT")},
-    disabled=["Name", "Team", "Salary", "Positions"],
+    disabled=["Name", "Team", "Opp", "PrimaryPos", "Salary", "Positions"],
     use_container_width=True,
     hide_index=True,
 )
@@ -289,26 +359,70 @@ if st.button("Save OUT"):
 # RECENCY SETTINGS
 # ==========================
 st.sidebar.markdown("---")
+st.sidebar.subheader("Recency Settings")
 use_recency = st.sidebar.checkbox("Use recency blend (top salaries)", value=True)
-top_n = st.sidebar.slider("Top N salaries to recency-blend", 0, 60, 30, 5)
+top_n = st.sidebar.slider("Top N salaries to recency-blend", 0, 60, 25, 5)
 last_n_games = st.sidebar.slider("Recent games (N)", 3, 15, 10, 1)
 
-st.sidebar.caption(
-    f"Blend: Minutes = {int(MIN_REC_W*100)}% recent / {int((1-MIN_REC_W)*100)}% season, "
-    f"Per-minute = {int(PM_REC_W*100)}% recent / {int((1-PM_REC_W)*100)}% season"
-)
+# ==========================
+# LOAD DVP
+# ==========================
+def load_dvp(dvp_text: str):
+    if not dvp_text:
+        return None, None
+
+    dvp = pd.read_csv(StringIO(dvp_text))
+    # try to find key columns
+    team_col = find_col(dvp, ["team", "tm", "opp"])
+    pos_col = find_col(dvp, ["pos", "position"])
+    if team_col is None or pos_col is None:
+        return None, f"DvP CSV missing Team/Position columns. Found columns: {list(dvp.columns)}"
+
+    # normalize
+    dvp["TEAM"] = dvp[team_col].astype(str).str.upper().str.strip()
+    dvp["POS"] = dvp[pos_col].astype(str).str.upper().str.strip()
+
+    # stat columns (common in Hashtag table exports)
+    col_pts = find_col(dvp, ["pts", "points"])
+    col_reb = find_col(dvp, ["reb", "trb", "rebounds"])
+    col_ast = find_col(dvp, ["ast", "assists"])
+    col_3pm = find_col(dvp, ["3pm", "3p", "fg3m", "3pm/g"])
+    col_stl = find_col(dvp, ["stl", "steals"])
+    col_blk = find_col(dvp, ["blk", "blocks"])
+    col_tov = find_col(dvp, ["to", "tov", "turnovers"])
+
+    needed = [col_pts, col_reb, col_ast, col_3pm, col_stl, col_blk, col_tov]
+    if any(c is None for c in needed):
+        return None, f"DvP CSV missing some stat columns. Columns found: {list(dvp.columns)}"
+
+    # keep & numeric
+    out = dvp[["TEAM", "POS", col_pts, col_reb, col_ast, col_3pm, col_stl, col_blk, col_tov]].copy()
+    out.columns = ["TEAM", "POS", "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV"]
+    for c in ["PTS","REB","AST","FG3M","STL","BLK","TOV"]:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out.dropna(subset=["PTS","REB","AST","FG3M","STL","BLK","TOV"]).copy()
+
+    # league avg by POS for multipliers
+    league_avg = out.groupby("POS")[["PTS","REB","AST","FG3M","STL","BLK","TOV"]].mean().reset_index()
+    return (out, league_avg), None
+
+dvp_pack = None
+dvp_err = None
+if dvp_text:
+    dvp_pack, dvp_err = load_dvp(dvp_text)
+    if dvp_err:
+        st.warning(dvp_err)
 
 # ==========================
-# STEP A — BUILD BASE (FAST + optional recency)
+# STEP A — BUILD BASE
 # ==========================
 st.divider()
 st.subheader("Step A — Build BASE")
 
 if st.button("Build BASE"):
-    nba_df = league_stats_df()
+    nba_df = league_player_df()
     rows = []
 
-    # Determine who gets recency
     top_salary_names = set()
     if use_recency and top_n > 0:
         tmp = slate.dropna(subset=["Salary"]).sort_values("Salary", ascending=False).head(int(top_n))
@@ -323,44 +437,29 @@ if st.button("Build BASE"):
             row = {**r.to_dict(),
                    "Minutes": np.nan, **{c: np.nan for c in STAT_COLS},
                    "Status": "ERR",
-                   "Notes": "No match in league stats (name mismatch)"}  # shows in debug
+                   "Notes": "No match in league stats (name mismatch)"}
             rows.append(row)
             continue
 
-        # season-to-date per-game
         season_min = float(hit["MIN"])
         season_stats = {c: float(hit[c]) for c in STAT_COLS}
 
-        # optional recency blend for top salaries
         notes = ""
-        status = "OK"
         mins = season_min
         stats = season_stats
 
         if use_recency and (r["Name_clean"] in top_salary_names):
             try:
                 rec_min, rec_rates = gamelog_recent(int(hit["PLAYER_ID"]), int(last_n_games))
-
-                # season per-minute rates
-                season_rates = {}
-                for c in STAT_COLS:
-                    season_rates[c] = float(season_stats[c]) / season_min if season_min > 0 else 0.0
-
-                # blend minutes
+                season_rates = {c: (season_stats[c] / season_min if season_min > 0 else 0.0) for c in STAT_COLS}
                 mins = MIN_REC_W * rec_min + (1 - MIN_REC_W) * season_min
-
-                # blend per-minute rates
-                blended_rates = {}
-                for c in STAT_COLS:
-                    blended_rates[c] = PM_REC_W * rec_rates[c] + (1 - PM_REC_W) * season_rates[c]
-
-                # rebuild stats = blended rate * blended minutes
+                blended_rates = {c: PM_REC_W * rec_rates[c] + (1 - PM_REC_W) * season_rates[c] for c in STAT_COLS}
                 stats = {c: round(blended_rates[c] * mins, 2) for c in STAT_COLS}
                 notes = f"RECENCY({last_n_games})"
             except Exception as e:
                 notes = f"RECENCY_FAIL: {str(e)[:80]}"
 
-        row = {**r.to_dict(), "Minutes": round(float(mins), 2), **stats, "Status": status, "Notes": notes}
+        row = {**r.to_dict(), "Minutes": round(float(mins), 2), **stats, "Status": "OK", "Notes": notes}
         rows.append(row)
 
     base = pd.DataFrame(rows)
@@ -368,15 +467,15 @@ if st.button("Build BASE"):
     gist_write({GIST_BASE: base.to_csv(index=False)})
 
     st.success("Saved BASE")
-    st.dataframe(base[["Name","Team","Salary","Minutes","DK_FP","Status","Notes"]], use_container_width=True)
+    st.dataframe(base[["Name","Team","Opp","PrimaryPos","Salary","Minutes","DK_FP","Status","Notes"]], use_container_width=True)
 
 # ==========================
-# STEP B — APPLY OUT + SAVE FINAL
+# STEP B — APPLY OUT + DVP + SAVE FINAL
 # ==========================
 st.divider()
-st.subheader("Step B — Apply OUT + Save FINAL")
+st.subheader("Step B — Apply OUT, then DvP, then Save FINAL")
 
-if st.button("Apply OUT"):
+if st.button("Run Projections (OUT + DvP)"):
     base_text = gist_read(GIST_BASE)
     if not base_text:
         st.error("No BASE found. Run Step A first.")
@@ -392,11 +491,13 @@ if st.button("Apply OUT"):
     base["Notes"] = base.get("Notes", "").fillna("").astype(str)
 
     base["BumpNotes"] = ""
+    base["DvPNotes"] = ""
+    base["DvPMult"] = 1.0
 
     # mark OUT
     base.loc[base["Name_clean"].isin(out_set), "Status"] = "OUT"
 
-    # lock per-minute rates BEFORE changing minutes (OK only)
+    # lock per-minute rates
     for c in STAT_COLS:
         base[c] = pd.to_numeric(base[c], errors="coerce")
         base[f"PM_{c}"] = np.where(
@@ -427,42 +528,76 @@ if st.button("Apply OUT"):
             base.loc[idx, "Minutes"] = min(float(base.loc[idx, "Minutes"]) + inc, MAX_MINUTES)
             base.loc[idx, "BumpNotes"] = (base.loc[idx, "BumpNotes"] + f" MIN+{inc:.1f}").strip()
 
-    # recompute stats
+    # recompute stats after OUT bump
     for idx in base.index[base["Status"] == "OK"]:
         m = base.loc[idx, "Minutes"]
         if pd.isna(m) or float(m) <= 0:
             continue
         for c in STAT_COLS:
             base.loc[idx, c] = round(float(base.loc[idx, f"PM_{c}"]) * float(m), 2)
-        base.loc[idx, "DK_FP"] = dk_fp(base.loc[idx])
+
+    # apply DvP opponent-by-position if provided
+    if dvp_pack is not None:
+        dvp_df, league_avg = dvp_pack
+
+        # quick dicts keyed by (TEAM, POS)
+        dvp_key = {}
+        for _, rr in dvp_df.iterrows():
+            dvp_key[(rr["TEAM"], rr["POS"])] = rr
+
+        avg_key = {}
+        for _, rr in league_avg.iterrows():
+            avg_key[rr["POS"]] = rr
+
+        for idx, r in base[base["Status"] == "OK"].iterrows():
+            opp = str(r.get("Opp", "")).upper().strip()
+            pos = str(r.get("PrimaryPos", "")).upper().strip()
+            if not opp or opp == "NAN" or not pos or pos == "NAN":
+                base.loc[idx, "DvPNotes"] = "DVP:NA"
+                continue
+
+            if (opp, pos) not in dvp_key or pos not in avg_key:
+                base.loc[idx, "DvPNotes"] = f"DVP:MISS({opp},{pos})"
+                continue
+
+            allowed = dvp_key[(opp, pos)]
+            avg = avg_key[pos]
+
+            # multipliers: allowed vs league avg allowed for that POS
+            mults = {}
+            for c in ["PTS","REB","AST","FG3M","STL","BLK","TOV"]:
+                av = float(avg[c])
+                al = float(allowed[c])
+                m = (al / av) if av > 0 else 1.0
+                mults[c] = clamp(m, DVP_CAP_LOW, DVP_CAP_HIGH)
+
+            # apply to stats (TOV also scaled but small cap keeps sane)
+            base.loc[idx, "PTS"] = round(float(base.loc[idx, "PTS"]) * mults["PTS"], 2)
+            base.loc[idx, "REB"] = round(float(base.loc[idx, "REB"]) * mults["REB"], 2)
+            base.loc[idx, "AST"] = round(float(base.loc[idx, "AST"]) * mults["AST"], 2)
+            base.loc[idx, "FG3M"] = round(float(base.loc[idx, "FG3M"]) * mults["FG3M"], 2)
+            base.loc[idx, "STL"] = round(float(base.loc[idx, "STL"]) * mults["STL"], 2)
+            base.loc[idx, "BLK"] = round(float(base.loc[idx, "BLK"]) * mults["BLK"], 2)
+            base.loc[idx, "TOV"] = round(float(base.loc[idx, "TOV"]) * mults["TOV"], 2)
+
+            base.loc[idx, "DvPMult"] = round(np.mean(list(mults.values())), 4)
+            base.loc[idx, "DvPNotes"] = f"DVP {opp} {pos} PTS{mults['PTS']:.2f} REB{mults['REB']:.2f} AST{mults['AST']:.2f}"
+
+    # DK FP final
+    base.loc[base["Status"] == "OK", "DK_FP"] = base[base["Status"] == "OK"].apply(dk_fp, axis=1)
 
     final = base[(base["Status"] == "OK") & (~base["Name_clean"].isin(out_set))].copy()
     gist_write({GIST_FINAL: final.to_csv(index=False)})
 
     st.success("Saved FINAL")
-    show_cols = ["Name","Team","Positions","Salary","Minutes","PTS","REB","AST","FG3M","STL","BLK","TOV","DK_FP","Notes","BumpNotes"]
+    show_cols = ["Name","Team","Opp","PrimaryPos","Salary","Minutes","PTS","REB","AST","FG3M","STL","BLK","TOV","DK_FP","Notes","BumpNotes","DvPNotes"]
     st.dataframe(final[show_cols], use_container_width=True)
 
-    # Debug missing
-    final_names = set(final["Name_clean"].astype(str).tolist())
-    slate_names = set(slate["Name_clean"].astype(str).tolist())
-    missing_from_final = sorted(list(slate_names - final_names))
-
-    with st.expander(f"Debug: Players missing from projections ({len(missing_from_final)})"):
-        if len(missing_from_final) == 0:
-            st.write("None 🎉")
-        else:
-            miss_df = base[base["Name_clean"].isin(missing_from_final)][
-                ["Name", "Team", "Salary", "Status", "Notes"]
-            ].copy()
-            miss_df = miss_df.sort_values(["Team","Status","Salary"], ascending=[True, True, False])
-            st.dataframe(miss_df, use_container_width=True, hide_index=True)
-
 # ==========================
-# OPTIMIZER (no duplicates)
+# OPTIMIZER
 # ==========================
 st.divider()
-st.subheader("Optimizer (Fixed)")
+st.subheader("Optimizer")
 
 final_text = gist_read(GIST_FINAL)
 if not final_text:
