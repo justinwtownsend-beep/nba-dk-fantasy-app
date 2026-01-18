@@ -1,11 +1,10 @@
 # ==========================
 # DraftKings NBA Optimizer
-# STABLE MODE
+# STABLE MODE (Minutes + Stats FIXED)
 # ==========================
 
 import json
 import time
-import random
 import difflib
 from io import StringIO
 
@@ -34,20 +33,6 @@ BUILD_SLEEP = 0.05
 
 MAX_MINUTES = 40
 BENCH_FLOOR = 6
-PROMOTE_WEIGHT = 3.0
-PROMOTE_BONUS = 1.5
-
-CORE_MINUTES = 26
-CORE_SALARY = 6500
-USG_STRENGTH = 0.18
-USG_CAP = 1.28
-CREATOR_TOP_N = 4
-
-# Gist files
-GIST_SLATE = "slate.csv"
-GIST_OUT = "out.json"
-GIST_BASE = "base.csv"
-GIST_FINAL = "final.csv"
 
 # ==========================
 # PAGE
@@ -67,12 +52,6 @@ def parse_minutes(x):
         return float(s)
     m, sec = s.split(":")
     return float(m) + float(sec) / 60
-
-def safe(x, d=0.0):
-    try:
-        return float(x)
-    except:
-        return d
 
 def dk_fp(r):
     fp = (
@@ -143,13 +122,11 @@ def player_id(name):
 
     last = name.split()[-1]
     hits = nba_players.find_players_by_last_name(last)
-    best = None
-    best_score = 0
+    best, best_score = None, 0
     for h in hits:
         score = difflib.SequenceMatcher(None, key, clean_name(h["full_name"])).ratio()
         if score > best_score:
-            best = h
-            best_score = score
+            best, best_score = h, score
     if best and best_score > 0.55:
         return best["id"]
 
@@ -159,8 +136,11 @@ def player_id(name):
 def gamelog(pid):
     for _ in range(GAMELOG_RETRIES):
         try:
-            df = playergamelog.PlayerGameLog(player_id=pid, season=SEASON, timeout=API_TIMEOUT).get_data_frames()[0]
-            return df
+            return playergamelog.PlayerGameLog(
+                player_id=pid,
+                season=SEASON,
+                timeout=API_TIMEOUT
+            ).get_data_frames()[0]
         except:
             time.sleep(1)
     raise RuntimeError("Gamelog failed")
@@ -180,9 +160,9 @@ def project_base(name, n):
 upload = st.sidebar.file_uploader("Upload DK CSV", type="csv")
 if upload:
     text = upload.getvalue().decode()
-    gist_write({GIST_SLATE: text})
+    gist_write({"slate.csv": text})
 else:
-    text = gist_read(GIST_SLATE)
+    text = gist_read("slate.csv")
     if not text:
         st.info("Upload a DraftKings CSV to begin.")
         st.stop()
@@ -199,7 +179,7 @@ slate["Name_clean"] = slate["Name"].apply(clean_name)
 # ==========================
 # OUT CHECKBOXES
 # ==========================
-saved_out = json.loads(gist_read(GIST_OUT) or "{}")
+saved_out = json.loads(gist_read("out.json") or "{}")
 slate["OUT"] = slate["Name_clean"].map(lambda x: saved_out.get(x, False))
 
 st.subheader("Step 1 — Mark OUT players")
@@ -215,11 +195,11 @@ out_flags = {clean_name(r["Name"]): bool(r["OUT"]) for _, r in edited.iterrows()
 out_set = {k for k, v in out_flags.items() if v}
 
 if st.button("Save OUT"):
-    gist_write({GIST_OUT: json.dumps(out_flags)})
+    gist_write({"out.json": json.dumps(out_flags)})
     st.success("Saved OUT players")
 
 # ==========================
-# STEP A
+# STEP A — BASE
 # ==========================
 st.divider()
 st.subheader("Step A — Build BASE (slow)")
@@ -234,47 +214,64 @@ if st.button("Build BASE"):
             mins, stats = project_base(r.Name, last_n)
             rows.append({**r, "Minutes": mins, **stats, "Status": "OK", "Notes": ""})
         except Exception as e:
-            rows.append({**r, "Minutes": np.nan, **{c: np.nan for c in STAT_COLS}, "Status": f"ERR", "Notes": str(e)})
+            rows.append({**r, "Minutes": np.nan, **{c: np.nan for c in STAT_COLS}, "Status": "ERR", "Notes": str(e)})
         time.sleep(BUILD_SLEEP)
     base = pd.DataFrame(rows)
     base["DK_FP"] = base.apply(lambda r: dk_fp(r) if r["Status"] == "OK" else np.nan, axis=1)
-    gist_write({GIST_BASE: base.to_csv(index=False)})
+    gist_write({"base.csv": base.to_csv(index=False)})
     st.success("Saved BASE")
 
 # ==========================
-# STEP B
+# STEP B — APPLY OUT (FIXED)
 # ==========================
 st.divider()
 st.subheader("Step B — Apply OUT + Save FINAL")
 
 if st.button("Apply OUT (fast)"):
-    base = pd.read_csv(StringIO(gist_read(GIST_BASE)))
+    base = pd.read_csv(StringIO(gist_read("base.csv")))
     base["Positions"] = base["Positions"].apply(eval)
+    base["Minutes"] = pd.to_numeric(base["Minutes"], errors="coerce")
     base["Notes"] = ""
 
+    # mark OUT
     base.loc[base["Name_clean"].isin(out_set), "Status"] = "OUT"
 
+    # lock baseline per-minute rates
+    for c in STAT_COLS:
+        base[c] = pd.to_numeric(base[c], errors="coerce")
+        base[f"PM_{c}"] = np.where(
+            (base["Status"] == "OK") & (base["Minutes"].fillna(0) > 0),
+            base[c].fillna(0) / base["Minutes"].replace(0, np.nan),
+            0.0
+        )
+        base[f"PM_{c}"] = base[f"PM_{c}"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # redistribute minutes by team
     for team in base["Team"].unique():
-        out = base[(base.Team == team) & (base.Status == "OUT")]
-        ok = base[(base.Team == team) & (base.Status == "OK")]
-        if out.empty or ok.empty:
+        out_t = base[(base.Team == team) & (base.Status == "OUT")]
+        ok_t  = base[(base.Team == team) & (base.Status == "OK")]
+        if out_t.empty or ok_t.empty:
             continue
 
-        missing = out["Minutes"].sum()
-        weights = ok["Minutes"].clip(lower=BENCH_FLOOR)
-        for i in ok.index:
-            inc = missing * weights.loc[i] / weights.sum()
-            base.loc[i, "Minutes"] = min(base.loc[i, "Minutes"] + inc, MAX_MINUTES)
-            base.loc[i, "Notes"] += f" MIN+{inc:.1f}"
+        missing = out_t["Minutes"].fillna(0).sum()
+        weights = ok_t["Minutes"].fillna(0).clip(lower=BENCH_FLOOR)
+        for idx in ok_t.index:
+            inc = missing * weights.loc[idx] / weights.sum()
+            base.loc[idx, "Minutes"] = min(base.loc[idx, "Minutes"] + inc, MAX_MINUTES)
+            base.loc[idx, "Notes"] += f" MIN+{inc:.1f}"
 
-    for i in base[base.Status == "OK"].index:
+    # recompute stats from locked per-minute
+    for idx in base.index[base["Status"] == "OK"]:
+        m = base.loc[idx, "Minutes"]
+        if m <= 0 or pd.isna(m):
+            continue
         for c in STAT_COLS:
-            pm = base.loc[i, c] / base.loc[i, "Minutes"]
-            base.loc[i, c] = round(pm * base.loc[i, "Minutes"], 2)
-        base.loc[i, "DK_FP"] = dk_fp(base.loc[i])
+            base.loc[idx, c] = round(base.loc[idx, f"PM_{c}"] * m, 2)
+        base.loc[idx, "DK_FP"] = dk_fp(base.loc[idx])
 
     final = base[(base.Status == "OK") & (~base.Name_clean.isin(out_set))]
-    gist_write({GIST_FINAL: final.to_csv(index=False)})
+    gist_write({"final.csv": final.to_csv(index=False)})
+
     st.success("Saved FINAL")
     st.dataframe(final, use_container_width=True)
 
@@ -284,16 +281,17 @@ if st.button("Apply OUT (fast)"):
 st.divider()
 st.subheader("Optimizer")
 
-final_text = gist_read(GIST_FINAL)
+final_text = gist_read("final.csv")
 if final_text and st.button("Optimize"):
     pool = pd.read_csv(StringIO(final_text))
     pool["Positions"] = pool["Positions"].apply(eval)
 
     prob = LpProblem("DK", LpMaximize)
     x = {}
+
     for i, r in pool.iterrows():
         for s in DK_SLOTS:
-            if s in r.Positions or s == "UTIL":
+            if s in r.Positions or s in ["G", "F", "UTIL"]:
                 x[(i, s)] = LpVariable(f"x_{i}_{s}", 0, 1, LpBinary)
 
     prob += lpSum(pool.loc[i, "DK_FP"] * x[(i, s)] for (i, s) in x)
