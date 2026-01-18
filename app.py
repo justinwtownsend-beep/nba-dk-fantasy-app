@@ -1,11 +1,17 @@
 # ==========================
 # DraftKings NBA Optimizer
-# STABLE MODE (Minutes + Stats FIXED + Optimizer FIXED + Missing Players Debug)
+# STABLE MODE
+# - Minutes+Stats fixed
+# - Optimizer fixed (no duplicates)
+# - Missing players debug (shows true error)
+# - Rebuild ERR players only
+# - Better player name matching
 # ==========================
 
 import json
 import time
 import difflib
+import re
 from io import StringIO
 
 import numpy as np
@@ -27,8 +33,8 @@ DK_SALARY_CAP = 50000
 DK_SLOTS = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
 STAT_COLS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M"]
 
-API_TIMEOUT = 25
-GAMELOG_RETRIES = 3
+API_TIMEOUT = 28
+GAMELOG_RETRIES = 5          # increased
 BUILD_SLEEP = 0.05
 
 MAX_MINUTES = 40
@@ -49,8 +55,16 @@ st.title("DraftKings NBA Optimizer — Stable Mode")
 # ==========================
 # HELPERS
 # ==========================
+SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
+
 def clean_name(s: str) -> str:
-    return " ".join(str(s).lower().replace(".", "").split())
+    return " ".join(str(s).lower().replace(".", "").replace(",", "").split())
+
+def strip_suffix(name: str) -> str:
+    parts = clean_name(name).split()
+    if parts and parts[-1] in SUFFIXES:
+        parts = parts[:-1]
+    return " ".join(parts)
 
 def parse_minutes(x) -> float:
     s = str(x)
@@ -126,23 +140,47 @@ def gist_write(files: dict):
 # ==========================
 @st.cache_data(ttl=3600)
 def player_map():
-    return {clean_name(p["full_name"]): int(p["id"]) for p in nba_players.get_players()}
+    plist = nba_players.get_players()
+    m = {clean_name(p["full_name"]): int(p["id"]) for p in plist}
+    # also map stripped suffix versions
+    for p in plist:
+        nm = clean_name(p["full_name"])
+        nm2 = strip_suffix(nm)
+        if nm2 and nm2 not in m:
+            m[nm2] = int(p["id"])
+    return m
 
 def player_id(name: str) -> int:
     key = clean_name(name)
+    key2 = strip_suffix(name)
     m = player_map()
+
     if key in m:
         return m[key]
+    if key2 in m:
+        return m[key2]
 
+    # nba_api helper
     hits = nba_players.find_players_by_full_name(name)
     if hits:
         return int(hits[0]["id"])
 
-    last = str(name).split()[-1]
+    # try without suffix
+    hits = nba_players.find_players_by_full_name(" ".join(key2.split()))
+    if hits:
+        return int(hits[0]["id"])
+
+    # last name fuzzy
+    parts = key2.split()
+    if not parts:
+        raise ValueError(f"Player not found: {name}")
+    last = parts[-1]
     hits = nba_players.find_players_by_last_name(last) or []
+
     best, best_score = None, 0.0
     for h in hits:
-        score = difflib.SequenceMatcher(None, key, clean_name(h.get("full_name", ""))).ratio()
+        cand = clean_name(h.get("full_name", ""))
+        score = difflib.SequenceMatcher(None, key2, cand).ratio()
         if score > best_score:
             best, best_score = h, score
     if best and best_score > 0.55:
@@ -153,7 +191,7 @@ def player_id(name: str) -> int:
 @st.cache_data(ttl=3600)
 def gamelog(pid: int) -> pd.DataFrame:
     last_err = None
-    for _ in range(GAMELOG_RETRIES):
+    for attempt in range(1, GAMELOG_RETRIES + 1):
         try:
             return playergamelog.PlayerGameLog(
                 player_id=pid,
@@ -162,7 +200,7 @@ def gamelog(pid: int) -> pd.DataFrame:
             ).get_data_frames()[0]
         except Exception as e:
             last_err = str(e)
-            time.sleep(1)
+            time.sleep(0.8 * attempt)
     raise RuntimeError(f"Gamelog failed: {last_err}")
 
 def project_base(name: str, n: int):
@@ -210,7 +248,6 @@ slate["Name_clean"] = slate["Name"].apply(clean_name)
 # ==========================
 # OUT CHECKBOXES
 # ==========================
-saved_out = {}
 try:
     saved_out = json.loads(gist_read(GIST_OUT) or "{}")
 except Exception:
@@ -245,23 +282,68 @@ st.divider()
 st.subheader("Step A — Build BASE (slow)")
 last_n = st.number_input("Recent games (N)", 1, 20, DEFAULT_LAST_N)
 
-if st.button("Build BASE"):
+build_base = st.button("Build BASE")
+rebuild_err_only = st.button("Rebuild ERR players only (faster)")
+
+def _save_base(base_df: pd.DataFrame):
+    gist_write({GIST_BASE: base_df.to_csv(index=False)})
+    st.success("Saved BASE")
+
+if build_base:
     rows = []
     prog = st.progress(0, text="Starting BASE build...")
+
     for i, r in slate.iterrows():
         prog.progress((i + 1) / len(slate), text=f"Running gamelog({r.Name}) ({i+1}/{len(slate)})")
         try:
             mins, stats = project_base(r.Name, int(last_n))
             row = {**r.to_dict(), "Minutes": mins, **stats, "Status": "OK", "Notes": ""}
         except Exception as e:
-            row = {**r.to_dict(), "Minutes": np.nan, **{c: np.nan for c in STAT_COLS}, "Status": "ERR", "Notes": str(e)[:180]}
+            msg = str(e)
+            row = {**r.to_dict(), "Minutes": np.nan, **{c: np.nan for c in STAT_COLS}, "Status": f"ERR: {msg[:60]}", "Notes": msg[:220]}
         rows.append(row)
         time.sleep(BUILD_SLEEP)
 
     base = pd.DataFrame(rows)
     base["DK_FP"] = base.apply(lambda rr: dk_fp(rr) if rr["Status"] == "OK" else np.nan, axis=1)
-    gist_write({GIST_BASE: base.to_csv(index=False)})
-    st.success("Saved BASE")
+    _save_base(base)
+
+if rebuild_err_only:
+    base_text = gist_read(GIST_BASE)
+    if not base_text:
+        st.error("No BASE found yet. Run Build BASE first.")
+        st.stop()
+
+    base = pd.read_csv(StringIO(base_text))
+    # restore positions list
+    base["Positions"] = base["Positions"].apply(eval)
+
+    err_mask = base["Status"].astype(str).str.startswith("ERR")
+    if err_mask.sum() == 0:
+        st.info("No ERR players to rebuild.")
+    else:
+        prog = st.progress(0, text="Rebuilding ERR players...")
+        err_idx = base.index[err_mask].tolist()
+
+        for j, idx in enumerate(err_idx, start=1):
+            nm = base.loc[idx, "Name"]
+            prog.progress(j / len(err_idx), text=f"Retry gamelog({nm}) ({j}/{len(err_idx)})")
+            try:
+                mins, stats = project_base(nm, int(last_n))
+                base.loc[idx, "Minutes"] = mins
+                for c in STAT_COLS:
+                    base.loc[idx, c] = stats[c]
+                base.loc[idx, "Status"] = "OK"
+                base.loc[idx, "Notes"] = ""
+                base.loc[idx, "DK_FP"] = dk_fp(base.loc[idx])
+            except Exception as e:
+                msg = str(e)
+                base.loc[idx, "Status"] = f"ERR: {msg[:60]}"
+                base.loc[idx, "Notes"] = msg[:220]
+                base.loc[idx, "DK_FP"] = np.nan
+            time.sleep(BUILD_SLEEP)
+
+        _save_base(base)
 
 # ==========================
 # STEP B — APPLY OUT (FAST) + DEBUG MISSING PLAYERS
@@ -275,23 +357,28 @@ if st.button("Apply OUT (fast)"):
         st.error("No BASE found. Run Step A first.")
         st.stop()
 
-    # always persist OUT selections with Step B
+    # persist OUT selections
     gist_write({GIST_OUT: json.dumps(out_flags, indent=2)})
 
     base = pd.read_csv(StringIO(base_text))
-
-    # restore list from string
     base["Positions"] = base["Positions"].apply(eval)
     base["Minutes"] = pd.to_numeric(base["Minutes"], errors="coerce")
     base["Salary"] = pd.to_numeric(base["Salary"], errors="coerce")
-    base["Notes"] = ""
     base["Status"] = base["Status"].astype(str)
     base["Name_clean"] = base.get("Name_clean", base["Name"].apply(clean_name))
+
+    # IMPORTANT: preserve existing Notes (don’t wipe error info)
+    if "Notes" not in base.columns:
+        base["Notes"] = ""
+    base["Notes"] = base["Notes"].fillna("").astype(str)
+
+    # separate bump notes so ERR notes stay intact
+    base["BumpNotes"] = ""
 
     # mark OUT
     base.loc[base["Name_clean"].isin(out_set), "Status"] = "OUT"
 
-    # lock per-minute rates BEFORE changing minutes
+    # lock per-minute rates BEFORE changing minutes (only OK players)
     for c in STAT_COLS:
         base[c] = pd.to_numeric(base[c], errors="coerce")
         base[f"PM_{c}"] = np.where(
@@ -320,7 +407,7 @@ if st.button("Apply OUT (fast)"):
         for idx in ok_t.index:
             inc = missing * float(weights.loc[idx]) / wsum
             base.loc[idx, "Minutes"] = min(float(base.loc[idx, "Minutes"]) + inc, MAX_MINUTES)
-            base.loc[idx, "Notes"] = (base.loc[idx, "Notes"] + f" MIN+{inc:.1f}").strip()
+            base.loc[idx, "BumpNotes"] = (base.loc[idx, "BumpNotes"] + f" MIN+{inc:.1f}").strip()
 
     # recompute stats from locked per-minute rates
     for idx in base.index[base["Status"] == "OK"]:
@@ -336,7 +423,8 @@ if st.button("Apply OUT (fast)"):
     gist_write({GIST_FINAL: final.to_csv(index=False)})
 
     st.success("Saved FINAL")
-    st.dataframe(final, use_container_width=True)
+    show_cols = ["Name", "Team", "Positions", "Salary", "Minutes", "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV", "DK_FP", "BumpNotes"]
+    st.dataframe(final[show_cols], use_container_width=True)
 
     # -------- Missing players debug (players on slate but not in final) --------
     final_names = set(final["Name_clean"].astype(str).tolist())
@@ -368,7 +456,6 @@ else:
         pool["Positions"] = pool["Positions"].apply(eval)
         pool["Salary"] = pd.to_numeric(pool["Salary"], errors="coerce")
         pool["DK_FP"] = pd.to_numeric(pool["DK_FP"], errors="coerce")
-        pool["Name_clean"] = pool.get("Name_clean", pool["Name"].apply(clean_name))
 
         pool = pool.dropna(subset=["Salary", "DK_FP"]).copy()
         pool = pool[pool["Salary"] > 0].copy()
@@ -385,18 +472,14 @@ else:
                 if eligible_for_slot(r["Positions"], slot):
                     x[(i, slot)] = LpVariable(f"x_{i}_{slot}", 0, 1, LpBinary)
 
-        # objective: maximize projected DK points
         prob += lpSum(pool.loc[i, "DK_FP"] * x[(i, slot)] for (i, slot) in x)
 
-        # exactly one player per slot
         for slot in DK_SLOTS:
             prob += lpSum(x[(i, slot)] for i in pool.index if (i, slot) in x) == 1
 
-        # each player can be used at most once across all slots (prevents dupes)
         for i in pool.index:
             prob += lpSum(x[(i, slot)] for slot in DK_SLOTS if (i, slot) in x) <= 1
 
-        # salary cap
         prob += lpSum(pool.loc[i, "Salary"] * x[(i, slot)] for (i, slot) in x) <= DK_SALARY_CAP
 
         prob.solve(PULP_CBC_CMD(msg=False))
@@ -411,8 +494,7 @@ else:
             if chosen is None:
                 st.error("No feasible lineup found (pool too small / slot constraints).")
                 st.stop()
-            row = pool.loc[chosen].to_dict()
-            lineup.append({"Slot": slot, **row})
+            lineup.append({"Slot": slot, **pool.loc[chosen].to_dict()})
 
         lineup_df = pd.DataFrame(lineup)
         st.dataframe(lineup_df, use_container_width=True)
