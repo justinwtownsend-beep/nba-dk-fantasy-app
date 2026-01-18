@@ -1,16 +1,12 @@
 # ==========================
 # DraftKings NBA Optimizer
-# FAST MODE (Streamlit Cloud Friendly)
-# - Step A uses ONE league endpoint (fast)
-# - Name matching fixed (diacritics like Dončić -> Doncic)
-# - OUT bumps redistribute minutes and scale stats correctly
-# - Missing players debug
-# - Optimizer fixed (no duplicates)
+# FAST + RECENCY BLEND (Top N salaries)
 # ==========================
 
 import json
 import difflib
 import unicodedata
+import time
 from io import StringIO
 
 import numpy as np
@@ -19,7 +15,11 @@ import streamlit as st
 import requests
 
 from pulp import LpProblem, LpMaximize, LpVariable, lpSum, LpBinary, PULP_CBC_CMD
+
 from nba_api.stats.endpoints import leaguedashplayerstats
+from nba_api.stats.endpoints import playergamelog
+from nba_api.stats.static import players as nba_players
+
 
 # ==========================
 # CONFIG
@@ -30,9 +30,19 @@ DK_SALARY_CAP = 50000
 DK_SLOTS = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
 STAT_COLS = ["PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M"]
 
-API_TIMEOUT = 20
+# league endpoint (fast)
+LEAGUE_TIMEOUT = 20
+
+# gamelog endpoint (slow-ish, but only for top N)
+GAMELOG_TIMEOUT = 12
+GAMELOG_RETRIES = 2
+
 MAX_MINUTES = 40
 BENCH_FLOOR = 6
+
+# Blend weights
+MIN_REC_W = 0.70      # minutes: favor recent
+PM_REC_W = 0.30       # per-minute: favor season
 
 # Gist files
 GIST_SLATE = "slate.csv"
@@ -44,7 +54,7 @@ GIST_FINAL = "final.csv"
 # PAGE
 # ==========================
 st.set_page_config(layout="wide")
-st.title("DraftKings NBA Optimizer — FAST Mode")
+st.title("DraftKings NBA Optimizer — FAST + Recency (Top Salaries)")
 
 # ==========================
 # HELPERS
@@ -52,10 +62,8 @@ st.title("DraftKings NBA Optimizer — FAST Mode")
 SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
 
 def deaccent(s: str) -> str:
-    """Turn Dončić -> Doncic, Šarić -> Saric, Jokić -> Jokic, etc."""
-    s = str(s)
     return (
-        unicodedata.normalize("NFKD", s)
+        unicodedata.normalize("NFKD", str(s))
         .encode("ascii", "ignore")
         .decode("ascii")
     )
@@ -103,6 +111,14 @@ def dk_fp(r):
         fp += 3.0
     return round(fp, 2)
 
+def parse_minutes_min(x):
+    # PlayerGameLog MIN usually "34" or "34:12"
+    s = str(x)
+    if ":" not in s:
+        return float(s)
+    m, sec = s.split(":")
+    return float(m) + float(sec) / 60
+
 # ==========================
 # GIST
 # ==========================
@@ -134,19 +150,19 @@ def gist_write(files):
     r.raise_for_status()
 
 # ==========================
-# NBA (FAST: one endpoint)
+# NBA DATA
 # ==========================
 @st.cache_data(ttl=900)
 def league_stats_df():
     df = leaguedashplayerstats.LeagueDashPlayerStats(
         season=SEASON,
         per_mode_detailed="PerGame",
-        timeout=API_TIMEOUT
+        timeout=LEAGUE_TIMEOUT
     ).get_data_frames()[0]
 
-    keep = ["PLAYER_NAME", "TEAM_ABBREVIATION", "MIN", "PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M"]
+    keep = ["PLAYER_ID", "PLAYER_NAME", "TEAM_ABBREVIATION", "MIN", "PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M"]
     df = df[keep].copy()
-    df.columns = ["NBA_Name", "NBA_Team", "MIN", "PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M"]
+    df.columns = ["PLAYER_ID", "NBA_Name", "NBA_Team", "MIN", "PTS", "REB", "AST", "STL", "BLK", "TOV", "FG3M"]
 
     df["NBA_Name_clean"] = df["NBA_Name"].apply(clean_name)
     df["NBA_Name_stripped"] = df["NBA_Name"].apply(strip_suffix)
@@ -154,44 +170,66 @@ def league_stats_df():
 
     return df
 
+@st.cache_data(ttl=3600)
+def static_player_map():
+    # Used only if you need to resolve IDs from names (fallback)
+    return {clean_name(p["full_name"]): int(p["id"]) for p in nba_players.get_players()}
+
 def match_player_to_nba(slate_name, nba_df):
     cn = clean_name(slate_name)
     sn = strip_suffix(slate_name)
 
-    # exact clean
     exact = nba_df[nba_df["NBA_Name_clean"] == cn]
     if not exact.empty:
         return exact.iloc[0]
 
-    # exact stripped (removes Jr/III etc.)
     exact2 = nba_df[nba_df["NBA_Name_stripped"] == sn]
     if not exact2.empty:
         return exact2.iloc[0]
 
-    # last-name filtered fuzzy (much safer than fuzzy vs whole league)
     parts = sn.split()
     if parts:
         last = parts[-1]
         cand = nba_df[nba_df["NBA_Last"] == last]
         if not cand.empty:
-            # choose best similarity
-            best_row = None
-            best_score = 0.0
+            best_row, best_score = None, 0.0
             for _, row in cand.iterrows():
                 score = difflib.SequenceMatcher(None, sn, row["NBA_Name_stripped"]).ratio()
                 if score > best_score:
-                    best_row = row
-                    best_score = score
+                    best_row, best_score = row, score
             if best_row is not None and best_score >= 0.75:
                 return best_row
 
-    # fallback: tight fuzzy on whole list (higher cutoff to avoid wrong matches)
+    # tight fuzzy fallback
     candidates = nba_df["NBA_Name_clean"].tolist()
     hit = difflib.get_close_matches(cn, candidates, n=1, cutoff=0.90)
     if hit:
         return nba_df[nba_df["NBA_Name_clean"] == hit[0]].iloc[0]
-
     return None
+
+def gamelog_recent(pid: int, last_n: int):
+    last_err = None
+    for attempt in range(1, GAMELOG_RETRIES + 1):
+        try:
+            gl = playergamelog.PlayerGameLog(
+                player_id=int(pid),
+                season=SEASON,
+                timeout=GAMELOG_TIMEOUT
+            ).get_data_frames()[0]
+            gl = gl.head(int(last_n)).copy()
+            if gl.empty:
+                raise RuntimeError("EMPTY_GAMELOG")
+            gl["MIN_f"] = gl["MIN"].apply(parse_minutes_min)
+            total_min = float(gl["MIN_f"].sum())
+            if total_min <= 0:
+                raise RuntimeError("NO_MINUTES_IN_SAMPLE")
+            rec_min = float(gl["MIN_f"].mean())
+            rec_rates = {c: float(gl[c].sum()) / total_min for c in STAT_COLS}
+            return rec_min, rec_rates
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(0.5 * attempt)
+    raise RuntimeError(f"RECENT_GAMELOG_FAIL: {last_err}")
 
 # ==========================
 # LOAD SLATE
@@ -248,48 +286,97 @@ if st.button("Save OUT"):
     st.success("Saved OUT players")
 
 # ==========================
-# STEP A — BUILD BASE (FAST)
+# RECENCY SETTINGS
+# ==========================
+st.sidebar.markdown("---")
+use_recency = st.sidebar.checkbox("Use recency blend (top salaries)", value=True)
+top_n = st.sidebar.slider("Top N salaries to recency-blend", 0, 60, 30, 5)
+last_n_games = st.sidebar.slider("Recent games (N)", 3, 15, 10, 1)
+
+st.sidebar.caption(
+    f"Blend: Minutes = {int(MIN_REC_W*100)}% recent / {int((1-MIN_REC_W)*100)}% season, "
+    f"Per-minute = {int(PM_REC_W*100)}% recent / {int((1-PM_REC_W)*100)}% season"
+)
+
+# ==========================
+# STEP A — BUILD BASE (FAST + optional recency)
 # ==========================
 st.divider()
-st.subheader("Step A — Build BASE (FAST)")
+st.subheader("Step A — Build BASE")
 
-if st.button("Build BASE (FAST)"):
+if st.button("Build BASE"):
     nba_df = league_stats_df()
     rows = []
-    prog = st.progress(0, text="Loading league stats + mapping DK slate...")
 
+    # Determine who gets recency
+    top_salary_names = set()
+    if use_recency and top_n > 0:
+        tmp = slate.dropna(subset=["Salary"]).sort_values("Salary", ascending=False).head(int(top_n))
+        top_salary_names = set(tmp["Name_clean"].tolist())
+
+    prog = st.progress(0, text="Mapping DK slate to league stats...")
     for i, r in slate.iterrows():
         prog.progress((i + 1) / len(slate), text=f"Mapping {r['Name']} ({i+1}/{len(slate)})")
         hit = match_player_to_nba(r["Name"], nba_df)
-        if hit is None:
-            row = {
-                **r.to_dict(),
-                "Minutes": np.nan,
-                **{c: np.nan for c in STAT_COLS},
-                "Status": "ERR",
-                "Notes": "No match in league stats (name mismatch / not in NBA stats)"
-            }
-        else:
-            mins = float(hit["MIN"])
-            stats = {c: float(hit[c]) for c in STAT_COLS}
-            row = {**r.to_dict(), "Minutes": mins, **stats, "Status": "OK", "Notes": ""}
 
+        if hit is None:
+            row = {**r.to_dict(),
+                   "Minutes": np.nan, **{c: np.nan for c in STAT_COLS},
+                   "Status": "ERR",
+                   "Notes": "No match in league stats (name mismatch)"}  # shows in debug
+            rows.append(row)
+            continue
+
+        # season-to-date per-game
+        season_min = float(hit["MIN"])
+        season_stats = {c: float(hit[c]) for c in STAT_COLS}
+
+        # optional recency blend for top salaries
+        notes = ""
+        status = "OK"
+        mins = season_min
+        stats = season_stats
+
+        if use_recency and (r["Name_clean"] in top_salary_names):
+            try:
+                rec_min, rec_rates = gamelog_recent(int(hit["PLAYER_ID"]), int(last_n_games))
+
+                # season per-minute rates
+                season_rates = {}
+                for c in STAT_COLS:
+                    season_rates[c] = float(season_stats[c]) / season_min if season_min > 0 else 0.0
+
+                # blend minutes
+                mins = MIN_REC_W * rec_min + (1 - MIN_REC_W) * season_min
+
+                # blend per-minute rates
+                blended_rates = {}
+                for c in STAT_COLS:
+                    blended_rates[c] = PM_REC_W * rec_rates[c] + (1 - PM_REC_W) * season_rates[c]
+
+                # rebuild stats = blended rate * blended minutes
+                stats = {c: round(blended_rates[c] * mins, 2) for c in STAT_COLS}
+                notes = f"RECENCY({last_n_games})"
+            except Exception as e:
+                notes = f"RECENCY_FAIL: {str(e)[:80]}"
+
+        row = {**r.to_dict(), "Minutes": round(float(mins), 2), **stats, "Status": status, "Notes": notes}
         rows.append(row)
 
     base = pd.DataFrame(rows)
     base["DK_FP"] = base.apply(lambda rr: dk_fp(rr) if rr["Status"] == "OK" else np.nan, axis=1)
     gist_write({GIST_BASE: base.to_csv(index=False)})
 
-    st.success("Saved BASE (FAST)")
-    st.dataframe(base[["Name", "Team", "Salary", "Minutes", "DK_FP", "Status"]], use_container_width=True)
+    st.success("Saved BASE")
+    st.dataframe(base[["Name","Team","Salary","Minutes","DK_FP","Status","Notes"]], use_container_width=True)
 
 # ==========================
-# STEP B — APPLY OUT + DEBUG
+# STEP B — APPLY OUT + SAVE FINAL
 # ==========================
 st.divider()
 st.subheader("Step B — Apply OUT + Save FINAL")
 
-if st.button("Apply OUT (fast)"):
+if st.button("Apply OUT"):
     base_text = gist_read(GIST_BASE)
     if not base_text:
         st.error("No BASE found. Run Step A first.")
@@ -353,7 +440,7 @@ if st.button("Apply OUT (fast)"):
     gist_write({GIST_FINAL: final.to_csv(index=False)})
 
     st.success("Saved FINAL")
-    show_cols = ["Name","Team","Positions","Salary","Minutes","PTS","REB","AST","FG3M","STL","BLK","TOV","DK_FP","BumpNotes"]
+    show_cols = ["Name","Team","Positions","Salary","Minutes","PTS","REB","AST","FG3M","STL","BLK","TOV","DK_FP","Notes","BumpNotes"]
     st.dataframe(final[show_cols], use_container_width=True)
 
     # Debug missing
@@ -372,7 +459,7 @@ if st.button("Apply OUT (fast)"):
             st.dataframe(miss_df, use_container_width=True, hide_index=True)
 
 # ==========================
-# OPTIMIZER (FIXED: no duplicates)
+# OPTIMIZER (no duplicates)
 # ==========================
 st.divider()
 st.subheader("Optimizer (Fixed)")
