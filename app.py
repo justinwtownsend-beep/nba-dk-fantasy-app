@@ -1,6 +1,7 @@
 # ==========================
 # DraftKings NBA Optimizer
-# Fast + Recency + Manual Hashtag DvP (your Sort: columns) + Late Swap Locks
+# Fast + Recency + Manual Hashtag DvP (Book1.csv "Sort:" columns) + Late Swap Locks
+# WITH TEAM ABBREVIATION NORMALIZATION (fixes NY/SA/etc.)
 # ==========================
 
 import json
@@ -51,11 +52,25 @@ GIST_LOCKS = "locks.json"
 GIST_BASE = "base.csv"
 GIST_FINAL = "final.csv"
 
+# Team abbreviation normalization (Hashtag vs DK vs NBA)
+TEAM_ALIASES = {
+    "NY": "NYK",
+    "SA": "SAS",
+    "GS": "GSW",
+    "NO": "NOP",
+    "PHO": "PHX",
+    # occasional variants
+    "UTAH": "UTA",
+    "WSH": "WAS",
+}
+
+
 # ==========================
 # PAGE
 # ==========================
 st.set_page_config(layout="wide")
 st.title("DK NBA Optimizer — Fast + DvP (Manual CSV) + Late Swap Locks")
+
 
 # ==========================
 # HELPERS
@@ -127,6 +142,15 @@ def parse_minutes_min(x):
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
 
+def norm_team(t: str) -> str:
+    if t is None:
+        return ""
+    t = str(t).replace("\xa0", " ").strip().upper()
+    if not t or t == "NAN":
+        return ""
+    t = t.split()[0]  # handles "NY  1" style cells
+    return TEAM_ALIASES.get(t, t)
+
 # DK "Game Info": "LAL@BOS 07:30PM ET"
 def parse_opponent_from_gameinfo(team_abbrev: str, game_info: str):
     if not isinstance(game_info, str):
@@ -138,6 +162,9 @@ def parse_opponent_from_gameinfo(team_abbrev: str, game_info: str):
     if "@" not in head:
         return None
     away, home = head.split("@", 1)
+    team_abbrev = norm_team(team_abbrev)
+    away = norm_team(away)
+    home = norm_team(home)
     if team_abbrev == away:
         return home
     if team_abbrev == home:
@@ -152,9 +179,7 @@ def _to_float_first_token(val):
     if pd.isna(val):
         return np.nan
     s = str(val)
-    # strip NBSP etc
     s = s.replace("\xa0", " ").strip()
-    # find first number (int or float)
     m = re.search(r"[-+]?\d*\.?\d+", s)
     if not m:
         return np.nan
@@ -170,6 +195,7 @@ def _team_first_token(val):
     if not s:
         return ""
     return s.split()[0]
+
 
 # ==========================
 # GIST
@@ -200,6 +226,7 @@ def gist_write(files):
     payload = {"files": {k: {"content": v} for k, v in files.items()}}
     r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=gh(), json=payload, timeout=25)
     r.raise_for_status()
+
 
 # ==========================
 # NBA (FAST)
@@ -276,6 +303,7 @@ def gamelog_recent(pid: int, last_n: int):
             time.sleep(0.4 * attempt)
     raise RuntimeError(f"RECENT_GAMELOG_FAIL: {last_err}")
 
+
 # ==========================
 # UPLOADS
 # ==========================
@@ -301,6 +329,7 @@ else:
         st.warning("Upload Hashtag DvP CSV to apply opponent adjustments (app still works without it).")
         dvp_text = None
 
+
 # ==========================
 # LOAD SLATE
 # ==========================
@@ -320,15 +349,17 @@ for cand in ["Game Info", "GameInfo", "Game_Info", "Game"]:
 slate = pd.DataFrame({
     "Name": df["Name"].astype(str),
     "Salary": pd.to_numeric(df["Salary"], errors="coerce"),
-    "Team": df["TeamAbbrev"].astype(str).str.upper(),
+    "Team": df["TeamAbbrev"].astype(str).apply(norm_team),
     "Positions": df["Position"].astype(str).apply(parse_positions),
 })
 slate["Name_clean"] = slate["Name"].apply(clean_name)
 slate["PrimaryPos"] = slate["Positions"].apply(primary_pos)
 slate["GameInfo"] = df[game_info_col].astype(str) if game_info_col else ""
 slate["Opp"] = slate.apply(lambda r: parse_opponent_from_gameinfo(r["Team"], r["GameInfo"]), axis=1)
+slate["Opp"] = slate["Opp"].apply(norm_team)
 
 teams_on_slate = sorted([t for t in slate["Team"].dropna().unique().tolist() if t and t != "NAN"])
+
 
 # ==========================
 # LOAD SAVED OUT + LOCKS
@@ -346,10 +377,12 @@ except Exception:
 saved_locked_teams = set(saved_locks.get("locked_teams", []))
 saved_locked_players = set(saved_locks.get("locked_players", []))
 
+
 # ==========================
 # TEAM LOCK UI
 # ==========================
 st.subheader("Late Swap Controls")
+
 locked_teams = st.multiselect(
     "Teams started / lock all players",
     teams_on_slate,
@@ -392,6 +425,7 @@ with c2:
         gist_write({GIST_LOCKS: json.dumps({"locked_teams": [], "locked_players": []}, indent=2)})
         st.success("Cleared locks (refresh page)")
 
+
 # ==========================
 # RECENCY SETTINGS
 # ==========================
@@ -400,6 +434,7 @@ st.sidebar.subheader("Recency Settings")
 use_recency = st.sidebar.checkbox("Use recency blend (top salaries)", value=True)
 top_n = st.sidebar.slider("Top N salaries to recency-blend", 0, 60, 25, 5)
 last_n_games = st.sidebar.slider("Recent games (N)", 3, 15, 10, 1)
+
 
 # ==========================
 # LOAD DVP (YOUR Book1.csv FORMAT)
@@ -417,7 +452,7 @@ def load_dvp_book1(text: str):
 
     out = pd.DataFrame()
     out["POS"] = dvp["Sort: Position"].astype(str).str.upper().str.strip()
-    out["TEAM"] = dvp["Sort: Team"].apply(_team_first_token)
+    out["TEAM"] = dvp["Sort: Team"].apply(lambda x: norm_team(_team_first_token(x)))
 
     out["PTS"] = dvp["Sort: PTS"].apply(_to_float_first_token)
     out["FG3M"] = dvp["Sort: 3PM"].apply(_to_float_first_token)
@@ -428,6 +463,7 @@ def load_dvp_book1(text: str):
     out["TOV"] = dvp["Sort: TO"].apply(_to_float_first_token)
 
     out = out.dropna(subset=["TEAM","POS","PTS","FG3M","REB","AST","STL","BLK","TOV"]).copy()
+    out = out[(out["TEAM"] != "") & (out["POS"] != "")].copy()
 
     league_avg = out.groupby("POS")[["PTS","REB","AST","FG3M","STL","BLK","TOV"]].mean().reset_index()
     return (out, league_avg), None
@@ -439,6 +475,7 @@ if dvp_text:
         st.warning(dvp_err)
     else:
         st.sidebar.success("DvP loaded ✓")
+
 
 # ==========================
 # STEP A — BUILD BASE
@@ -495,6 +532,7 @@ if st.button("Build BASE"):
     gist_write({GIST_BASE: base.to_csv(index=False)})
     st.success("Saved BASE")
     st.dataframe(base[["Name","Team","Opp","PrimaryPos","Salary","Minutes","DK_FP","Status","Notes"]], use_container_width=True)
+
 
 # ==========================
 # STEP B — RUN PROJECTIONS (OUT bumps + DvP)
@@ -569,9 +607,9 @@ if st.button("Run Projections"):
         avg_key = {rr["POS"]: rr for _, rr in league_avg.iterrows()}
 
         for idx, r in base[base["Status"] == "OK"].iterrows():
-            opp = str(r.get("Opp","")).upper().strip()
-            pos = str(r.get("PrimaryPos","")).upper().strip()
-            if not opp or opp == "NAN" or not pos or pos == "NAN":
+            opp = norm_team(r.get("Opp", ""))
+            pos = str(r.get("PrimaryPos", "")).upper().strip()
+            if not opp or not pos or opp == "NAN" or pos == "NAN":
                 base.loc[idx, "DvPNotes"] = "DVP:NA"
                 continue
 
@@ -583,8 +621,6 @@ if st.button("Run Projections"):
             avg = avg_key[pos]
 
             mults = {}
-            # map DvP columns -> our projection columns
-            # (DvP has PTS, REB, AST, FG3M, STL, BLK, TOV)
             for c in ["PTS","REB","AST","FG3M","STL","BLK","TOV"]:
                 av = float(avg[c])
                 al = float(allowed[c])
@@ -595,7 +631,10 @@ if st.button("Run Projections"):
                 base.loc[idx, c] = round(float(base.loc[idx, c]) * mults[c], 2)
 
             base.loc[idx, "DvPMult"] = round(float(np.mean(list(mults.values()))), 4)
-            base.loc[idx, "DvPNotes"] = f"DVP {opp} {pos} PTS{mults['PTS']:.2f} REB{mults['REB']:.2f} AST{mults['AST']:.2f}"
+            base.loc[idx, "DvPNotes"] = (
+                f"DVP {opp} {pos} "
+                f"PTS{mults['PTS']:.2f} REB{mults['REB']:.2f} AST{mults['AST']:.2f}"
+            )
 
     base.loc[base["Status"] == "OK", "DK_FP"] = base[base["Status"] == "OK"].apply(dk_fp, axis=1)
 
@@ -605,6 +644,7 @@ if st.button("Run Projections"):
     st.success("Saved FINAL")
     show_cols = ["Name","Team","Opp","PrimaryPos","Salary","Minutes","PTS","REB","AST","FG3M","STL","BLK","TOV","DK_FP","Notes","BumpNotes","DvPNotes"]
     st.dataframe(final[show_cols], use_container_width=True)
+
 
 # ==========================
 # OPTIMIZER (LATE SWAP)
@@ -662,7 +702,7 @@ if st.button("Optimize (respect locks)"):
     candidate_df = pool.copy()
     if started_teams:
         candidate_df = candidate_df[~candidate_df["Team"].isin(started_teams)].copy()
-        candidate_df = pd.concat([candidate_df, locked_df], axis=0).drop_duplicates()
+        candidate_df = pd.concat([candidate_df, locked_df], axis=0).drop_duplicates(subset=["Name_clean"])
 
     locked_assignment = {}
     remaining_slots = DK_SLOTS.copy()
