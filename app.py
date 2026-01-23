@@ -379,18 +379,35 @@ saved_locked_players = set(saved_locks.get("locked_players", []))
 
 
 # ==========================
-# TEAM LOCK UI
+# TEAM LOCK UI + EXCLUDES
 # ==========================
 st.subheader("Late Swap Controls")
 
+# Teams started: exclude from NEW selections only (late swap behavior)
 locked_teams = st.multiselect(
-    "Teams started / lock all players",
+    "Teams started (exclude from NEW selections)",
     teams_on_slate,
     default=[t for t in teams_on_slate if t in saved_locked_teams]
 )
 
-slate["LOCK"] = slate["Team"].isin(set(locked_teams))
-slate["LOCK"] = slate.apply(lambda r: True if r["Name_clean"] in saved_locked_players else bool(r["LOCK"]), axis=1)
+# NEW: exclude whole teams from optimizer pool
+excluded_teams = st.multiselect(
+    "Exclude teams from optimizer pool",
+    teams_on_slate,
+    default=[]
+)
+excluded_teams_set = set(excluded_teams)
+
+# NEW: exclude specific players from optimizer pool
+excluded_players = st.multiselect(
+    "Exclude players from optimizer pool",
+    slate["Name"].tolist(),
+    default=[]
+)
+excluded_players_set = set(clean_name(x) for x in excluded_players)
+
+# IMPORTANT: do NOT auto-lock whole teams anymore
+slate["LOCK"] = slate["Name_clean"].map(lambda x: True if x in saved_locked_players else False)
 slate["OUT"] = slate["Name_clean"].map(lambda x: bool(saved_out.get(x, False)))
 
 edited = st.data_editor(
@@ -524,7 +541,6 @@ if st.button("Build BASE"):
             except Exception as e:
                 notes = f"RECENCY_FAIL: {str(e)[:80]}"
 
-        # ✅ MINUTES HARD CAP (34)
         mins = min(float(mins), MAX_MINUTES)
 
         row = {**r.to_dict(), "Minutes": round(float(mins), 2), **stats, "Status": "OK", "Notes": notes}
@@ -671,6 +687,10 @@ pool = pool[pool["Salary"] > 0].copy()
 if "Name_clean" not in pool.columns:
     pool["Name_clean"] = pool["Name"].apply(clean_name)
 
+# Apply optimizer EXCLUDES (teams + players)
+pool = pool[~pool["Team"].isin(excluded_teams_set)].copy()
+pool = pool[~pool["Name_clean"].isin(excluded_players_set)].copy()
+
 started_teams = set(locked_teams)
 
 def assign_locked_to_slots(locked_df):
@@ -700,6 +720,12 @@ def assign_locked_to_slots(locked_df):
     return assignment if ok else None
 
 if st.button("Optimize (respect locks)"):
+    # Safety: can't exclude a locked player
+    conflict = [p for p in locked_players_set if p in excluded_players_set]
+    if conflict:
+        st.error("You excluded players that are also LOCKed. Un-lock them or remove them from Exclude Players.")
+        st.stop()
+
     locked_df = pool[pool["Name_clean"].isin(locked_players_set)].copy()
 
     # Exclude started teams from NEW selections (but keep locked players even if started)
@@ -793,4 +819,4 @@ if st.button("Optimize (respect locks)"):
     st.metric("Total DK FP", round(float(lineup_df["DK_FP"].sum()), 2))
 
     if started_teams:
-        st.caption(f"Started/locked teams excluded from NEW selections: {', '.join(sorted(list(started_teams)))}")
+        st.caption(f"Started teams excluded from NEW selections: {', '.join(sorted(list(started_teams)))}")
