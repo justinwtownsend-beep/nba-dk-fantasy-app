@@ -2,9 +2,6 @@
 # DraftKings NBA Optimizer
 # Fast + Recency + Manual Hashtag DvP (Book1.csv "Sort:" columns) + Late Swap Locks
 # WITH TEAM ABBREVIATION NORMALIZATION (fixes NY/SA/etc.)
-# + EXCLUDE (teams/players) from optimizer pool
-# + MAX MINUTES CAP (34)
-# + CONSERVATIVE INJURY STAT BUMPS (usage proxy; no on/off splits)
 # ==========================
 
 import json
@@ -65,17 +62,6 @@ TEAM_ALIASES = {
     # occasional variants
     "UTAH": "UTA",
     "WSH": "WAS",
-}
-
-# Conservative injury bump caps
-MAX_SHARE_OF_MISSING_PER_PLAYER = 0.35  # no one absorbs >35% of missing stat
-CAP_PM_BOOST_PCT_SKILL = 0.20           # max +20% effective bump for PTS/AST/FG3M
-CAP_PM_BOOST_PCT_REB = 0.15             # max +15% effective bump for REB
-ABS_CAP = {                             # absolute caps per player (per slate)
-    "PTS": 6.0,
-    "AST": 3.0,
-    "FG3M": 2.0,
-    "REB": 4.0,
 }
 
 
@@ -210,36 +196,18 @@ def _team_first_token(val):
         return ""
     return s.split()[0]
 
-def is_guard(pos_list):
-    s = set(pos_list or [])
-    return bool(s & {"PG", "SG"})
-
-def is_big(pos_list):
-    s = set(pos_list or [])
-    return bool(s & {"PF", "C"})
-
 
 # ==========================
 # GIST
 # ==========================
-try:
-    GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
-    GIST_ID = st.secrets["GIST_ID"]
-except Exception:
-    st.error("Missing Streamlit secrets: GITHUB_TOKEN and/or GIST_ID.")
-    st.stop()
+GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
+GIST_ID = st.secrets["GIST_ID"]
 
 def gh():
     return {"Authorization": f"token {GITHUB_TOKEN}"}
 
 def gist():
     r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=gh(), timeout=25)
-    if r.status_code == 401:
-        st.error("GitHub token unauthorized (401). Check GITHUB_TOKEN in Streamlit Secrets.")
-        st.stop()
-    if r.status_code == 404:
-        st.error("Gist not found (404). Check GIST_ID in Streamlit Secrets.")
-        st.stop()
     r.raise_for_status()
     return r.json()
 
@@ -254,10 +222,27 @@ def gist_read(name):
     r.raise_for_status()
     return r.text
 
+# SAFE gist write (403 won't crash app)
 def gist_write(files):
     payload = {"files": {k: {"content": v} for k, v in files.items()}}
-    r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=gh(), json=payload, timeout=25)
-    r.raise_for_status()
+    try:
+        r = requests.patch(
+            f"https://api.github.com/gists/{GIST_ID}",
+            headers=gh(),
+            json=payload,
+            timeout=25
+        )
+        if r.status_code == 403:
+            st.warning(
+                "GitHub blocked a Gist write (403). Likely rate limit/abuse protection. "
+                "Continuing without saving this change to the Gist."
+            )
+            return False
+        r.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as e:
+        st.warning(f"Gist write failed ({type(e).__name__}). Continuing without saving.")
+        return False
 
 
 # ==========================
@@ -411,32 +396,18 @@ saved_locked_players = set(saved_locks.get("locked_players", []))
 
 
 # ==========================
-# LATE SWAP CONTROLS + EXCLUDE
+# TEAM LOCK UI
 # ==========================
 st.subheader("Late Swap Controls")
 
 locked_teams = st.multiselect(
-    "Teams started (exclude from NEW selections)",
+    "Teams started / lock all players",
     teams_on_slate,
     default=[t for t in teams_on_slate if t in saved_locked_teams]
 )
 
-excluded_teams = st.multiselect(
-    "Exclude teams from optimizer pool",
-    teams_on_slate,
-    default=[]
-)
-excluded_teams_set = set(excluded_teams)
-
-excluded_players = st.multiselect(
-    "Exclude players from optimizer pool",
-    slate["Name"].tolist(),
-    default=[]
-)
-excluded_players_set = set(clean_name(x) for x in excluded_players)
-
-# Do NOT auto-lock whole teams
-slate["LOCK"] = slate["Name_clean"].map(lambda x: True if x in saved_locked_players else False)
+slate["LOCK"] = slate["Team"].isin(set(locked_teams))
+slate["LOCK"] = slate.apply(lambda r: True if r["Name_clean"] in saved_locked_players else bool(r["LOCK"]), axis=1)
 slate["OUT"] = slate["Name_clean"].map(lambda x: bool(saved_out.get(x, False)))
 
 edited = st.data_editor(
@@ -570,7 +541,6 @@ if st.button("Build BASE"):
             except Exception as e:
                 notes = f"RECENCY_FAIL: {str(e)[:80]}"
 
-        mins = min(float(mins), MAX_MINUTES)
         row = {**r.to_dict(), "Minutes": round(float(mins), 2), **stats, "Status": "OK", "Notes": notes}
         rows.append(row)
 
@@ -582,7 +552,7 @@ if st.button("Build BASE"):
 
 
 # ==========================
-# STEP B — RUN PROJECTIONS (OUT bumps + Conservative Stat Bumps + DvP)
+# STEP B — RUN PROJECTIONS (OUT bumps + DvP)
 # ==========================
 st.divider()
 st.subheader("Step B — Run Projections (OUT bumps + DvP)")
@@ -593,17 +563,9 @@ if st.button("Run Projections"):
         st.error("No BASE found. Run Step A first.")
         st.stop()
 
-    gist_write({GIST_OUT: json.dumps(out_flags, indent=2)})
-
     base = pd.read_csv(StringIO(base_text))
-
-    # Ensure needed cols exist
-    if "Name_clean" not in base.columns:
-        base["Name_clean"] = base["Name"].astype(str).apply(clean_name)
-
     base["Positions"] = base["Positions"].apply(eval)
     base["Minutes"] = pd.to_numeric(base["Minutes"], errors="coerce")
-    base["Minutes"] = base["Minutes"].clip(upper=MAX_MINUTES)
     base["Salary"] = pd.to_numeric(base["Salary"], errors="coerce")
     base["Status"] = base["Status"].astype(str)
     base["Notes"] = base.get("Notes", "").fillna("").astype(str)
@@ -611,17 +573,13 @@ if st.button("Run Projections"):
     base["BumpNotes"] = ""
     base["DvPNotes"] = ""
     base["DvPMult"] = 1.0
-    base["UsageNotes"] = ""
 
-    # Mark OUT
+    # Mark OUT (from editor)
     base.loc[base["Name_clean"].isin(out_set), "Status"] = "OUT"
 
-    # Convert stat cols to numeric
+    # per-minute rates BEFORE minute change
     for c in STAT_COLS:
         base[c] = pd.to_numeric(base[c], errors="coerce")
-
-    # per-minute rates BEFORE minute change (from BASE)
-    for c in STAT_COLS:
         base[f"PM_{c}"] = np.where(
             (base["Status"] == "OK") & (base["Minutes"].fillna(0) > 0),
             base[c].fillna(0) / base["Minutes"].replace(0, np.nan),
@@ -629,9 +587,7 @@ if st.button("Run Projections"):
         )
         base[f"PM_{c}"] = base[f"PM_{c}"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    # --------------------------
-    # 1) Redistribute minutes by team (capped)
-    # --------------------------
+    # redistribute minutes by team
     for team in base["Team"].dropna().unique():
         out_t = base[(base["Team"] == team) & (base["Status"] == "OUT")]
         ok_t = base[(base["Team"] == team) & (base["Status"] == "OK")]
@@ -652,7 +608,7 @@ if st.button("Run Projections"):
             base.loc[idx, "Minutes"] = min(float(base.loc[idx, "Minutes"]) + inc, MAX_MINUTES)
             base.loc[idx, "BumpNotes"] = (base.loc[idx, "BumpNotes"] + f" MIN+{inc:.1f}").strip()
 
-    # Recompute stats after minutes bump using ORIGINAL per-minute rates
+    # recompute stats after OUT bump
     for idx in base.index[base["Status"] == "OK"]:
         m = base.loc[idx, "Minutes"]
         if pd.isna(m) or float(m) <= 0:
@@ -660,111 +616,7 @@ if st.button("Run Projections"):
         for c in STAT_COLS:
             base.loc[idx, c] = round(float(base.loc[idx, f"PM_{c}"]) * float(m), 2)
 
-    # --------------------------
-    # 2) Conservative "Usage/Stat" bumps from OUT players (team-level redistribution)
-    #    This is the key improvement for injury slates.
-    # --------------------------
-    def _safe_series(x):
-        return pd.to_numeric(x, errors="coerce").fillna(0.0)
-
-    for team in base["Team"].dropna().unique():
-        out_t = base[(base["Team"] == team) & (base["Status"] == "OUT")]
-        ok_t = base[(base["Team"] == team) & (base["Status"] == "OK")]
-        if out_t.empty or ok_t.empty:
-            continue
-
-        # Missing production (from BASE totals after minutes bump, OUT players set to OUT)
-        missing_pts = float(_safe_series(out_t["PTS"]).sum())
-        missing_ast = float(_safe_series(out_t["AST"]).sum())
-        missing_fg3m = float(_safe_series(out_t["FG3M"]).sum())
-        missing_reb = float(_safe_series(out_t["REB"]).sum())
-
-        if (missing_pts + missing_ast + missing_fg3m + missing_reb) <= 0:
-            continue
-
-        # Build weights
-        ok_idx = ok_t.index.tolist()
-        salary = _safe_series(ok_t["Salary"]).replace(0, np.nan).fillna(1.0)
-
-        pm_pts = _safe_series(ok_t["PM_PTS"]).replace(0, np.nan).fillna(0.01)
-        pm_ast = _safe_series(ok_t["PM_AST"]).replace(0, np.nan).fillna(0.005)
-        pm_fg3m = _safe_series(ok_t["PM_FG3M"]).replace(0, np.nan).fillna(0.003)
-        pm_reb = _safe_series(ok_t["PM_REB"]).replace(0, np.nan).fillna(0.01)
-
-        guard_flag = ok_t["Positions"].apply(is_guard).astype(float).replace(0.0, 0.25)  # non-guards still can get some
-        big_flag = ok_t["Positions"].apply(is_big).astype(float).replace(0.0, 0.25)
-
-        w_pts = (salary * pm_pts).fillna(0.0)
-        w_ast = (salary * pm_ast * guard_flag).fillna(0.0)
-        w_fg3m = (salary * pm_fg3m).fillna(0.0)
-        w_reb = (salary * pm_reb * big_flag).fillna(0.0)
-
-        def distribute(missing, w, stat_name):
-            if missing <= 0:
-                return {i: 0.0 for i in ok_idx}
-
-            ws = float(w.sum())
-            if ws <= 0:
-                # fallback to salary
-                w2 = salary.fillna(1.0)
-                ws = float(w2.sum())
-                if ws <= 0:
-                    return {i: 0.0 for i in ok_idx}
-                w = w2
-
-            alloc = {}
-            for i, idx in enumerate(ok_idx):
-                share = float(w.iloc[i]) / float(ws) if ws > 0 else 0.0
-                share = min(share, MAX_SHARE_OF_MISSING_PER_PLAYER)
-                alloc[idx] = missing * share
-
-            # Renormalize after share caps so we don't "lose" too much
-            total_alloc = float(sum(alloc.values()))
-            if total_alloc > 0 and total_alloc < missing:
-                scale = missing / total_alloc
-                for idx in alloc:
-                    alloc[idx] *= scale
-
-            # Apply conservative per-player caps (percent + absolute)
-            for idx in alloc:
-                base_val = float(base.loc[idx, stat_name]) if pd.notna(base.loc[idx, stat_name]) else 0.0
-                pct_cap = CAP_PM_BOOST_PCT_REB if stat_name == "REB" else CAP_PM_BOOST_PCT_SKILL
-                cap_amt = max(0.0, base_val * pct_cap)
-                cap_amt = min(cap_amt, ABS_CAP.get(stat_name, cap_amt))
-                alloc[idx] = min(float(alloc[idx]), float(cap_amt))
-
-            return alloc
-
-        add_pts = distribute(missing_pts, w_pts, "PTS")
-        add_ast = distribute(missing_ast, w_ast, "AST")
-        add_fg3m = distribute(missing_fg3m, w_fg3m, "FG3M")
-        add_reb = distribute(missing_reb, w_reb, "REB")
-
-        # Apply additions
-        for idx in ok_idx:
-            apts = float(add_pts.get(idx, 0.0))
-            aast = float(add_ast.get(idx, 0.0))
-            a3 = float(add_fg3m.get(idx, 0.0))
-            areb = float(add_reb.get(idx, 0.0))
-
-            if (apts + aast + a3 + areb) <= 0:
-                continue
-
-            base.loc[idx, "PTS"] = round(float(base.loc[idx, "PTS"]) + apts, 2)
-            base.loc[idx, "AST"] = round(float(base.loc[idx, "AST"]) + aast, 2)
-            base.loc[idx, "FG3M"] = round(float(base.loc[idx, "FG3M"]) + a3, 2)
-            base.loc[idx, "REB"] = round(float(base.loc[idx, "REB"]) + areb, 2)
-
-            notes = []
-            if apts > 0.05: notes.append(f"+{apts:.1f}PTS")
-            if aast > 0.05: notes.append(f"+{aast:.1f}AST")
-            if a3 > 0.05: notes.append(f"+{a3:.1f}3PM")
-            if areb > 0.05: notes.append(f"+{areb:.1f}REB")
-            base.loc[idx, "UsageNotes"] = (" ".join(notes)).strip()
-
-    # --------------------------
-    # 3) Apply DvP vs opponent by position
-    # --------------------------
+    # Apply DvP vs opponent by position
     if dvp_pack is not None:
         dvp_df, league_avg = dvp_pack
         dvp_key = {(rr["TEAM"], rr["POS"]): rr for _, rr in dvp_df.iterrows()}
@@ -800,16 +652,13 @@ if st.button("Run Projections"):
                 f"PTS{mults['PTS']:.2f} REB{mults['REB']:.2f} AST{mults['AST']:.2f}"
             )
 
-    # Final DK FP
     base.loc[base["Status"] == "OK", "DK_FP"] = base[base["Status"] == "OK"].apply(dk_fp, axis=1)
 
-    # Remove OUT from final table (but keep OUT in background in `base`)
     final = base[(base["Status"] == "OK") & (~base["Name_clean"].isin(out_set))].copy()
     gist_write({GIST_FINAL: final.to_csv(index=False)})
 
     st.success("Saved FINAL")
-    show_cols = ["Name","Team","Opp","PrimaryPos","Salary","Minutes","PTS","REB","AST","FG3M","STL","BLK","TOV","DK_FP",
-                 "Notes","BumpNotes","UsageNotes","DvPNotes"]
+    show_cols = ["Name","Team","Opp","PrimaryPos","Salary","Minutes","PTS","REB","AST","FG3M","STL","BLK","TOV","DK_FP","Notes","BumpNotes","DvPNotes"]
     st.dataframe(final[show_cols], use_container_width=True)
 
 
@@ -817,7 +666,7 @@ if st.button("Run Projections"):
 # OPTIMIZER (LATE SWAP)
 # ==========================
 st.divider()
-st.subheader("Optimizer (Late Swap — respects Team Started + Player LOCK)")
+st.subheader("Optimizer (Late Swap — respects Team Locks + Player LOCK)")
 
 final_text = gist_read(GIST_FINAL)
 if not final_text:
@@ -832,11 +681,7 @@ pool = pool.dropna(subset=["Salary","DK_FP"]).copy()
 pool = pool[pool["Salary"] > 0].copy()
 
 if "Name_clean" not in pool.columns:
-    pool["Name_clean"] = pool["Name"].astype(str).apply(clean_name)
-
-# Apply optimizer EXCLUDES (teams + players)
-pool = pool[~pool["Team"].isin(excluded_teams_set)].copy()
-pool = pool[~pool["Name_clean"].isin(excluded_players_set)].copy()
+    pool["Name_clean"] = pool["Name"].apply(clean_name)
 
 started_teams = set(locked_teams)
 
@@ -867,12 +712,6 @@ def assign_locked_to_slots(locked_df):
     return assignment if ok else None
 
 if st.button("Optimize (respect locks)"):
-    # Safety: can't exclude a locked player
-    conflict = [p for p in locked_players_set if p in excluded_players_set]
-    if conflict:
-        st.error("You excluded players that are also LOCKed. Un-lock them or remove them from Exclude Players.")
-        st.stop()
-
     locked_df = pool[pool["Name_clean"].isin(locked_players_set)].copy()
 
     # Exclude started teams from NEW selections (but keep locked players even if started)
@@ -924,7 +763,7 @@ if st.button("Optimize (respect locks)"):
                 x[(i, slot)] = LpVariable(f"x_{i}_{slot}", 0, 1, LpBinary)
 
     if not x:
-        st.error("No feasible candidates for remaining slots (too many teams started / too many players out).")
+        st.error("No feasible candidates for remaining slots (too many teams locked / too many players out).")
         st.stop()
 
     prob += lpSum(opt_pool.loc[i, "DK_FP"] * x[(i, slot)] for (i, slot) in x)
@@ -966,4 +805,4 @@ if st.button("Optimize (respect locks)"):
     st.metric("Total DK FP", round(float(lineup_df["DK_FP"].sum()), 2))
 
     if started_teams:
-        st.caption(f"Started teams excluded from NEW selections: {', '.join(sorted(list(started_teams)))}")
+        st.caption(f"Started/locked teams excluded from NEW selections: {', '.join(sorted(list(started_teams)))}")
