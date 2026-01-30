@@ -1,12 +1,8 @@
 # ==========================
-# DraftKings NBA Optimizer (Stable + Fast + More Accurate Injury Bumps)
-# - Fast base from NBA API season stats + optional recency blend for top salaries
-# - Deterministic mode (freeze BASE so projections don't "mysteriously" change)
-# - Injury handling upgraded: Minutes + Opportunity (PTS/AST/3PM/REB) redistribution (no on/off splits)
-# - Realistic minute caps: starters vs bench + absolute cap (MAX_MINUTES_ABS)
-# - DvP (manual upload) with tighter caps
-# - Late swap locks (team locks exclude from NEW picks + player locks)
-# - Gist write 403-safe; avoids writing OUT during Step B
+# DraftKings NBA Optimizer — Stable + Fast + DvP (Manual CSV) + Late Swap Locks
+# Edits INCLUDED:
+#   1) Top table column order: Salary immediately after Name
+#   2) EXCLUDE checkbox + Save/Load to remove players from OPTIMIZER pool (still in projections)
 # ==========================
 
 import json
@@ -39,19 +35,18 @@ LEAGUE_TIMEOUT = 20
 GAMELOG_TIMEOUT = 12
 GAMELOG_RETRIES = 2
 
-# --- Minute caps (realistic)
+# Minutes caps (semi-realistic + your hard cap)
 STARTER_MIN_CUTOFF = 28.0
 STARTER_CAP = 36.0
 BENCH_CAP = 32.0
-MAX_MINUTES_ABS = 34.0  # <--- your hard rule
-
+MAX_MINUTES_ABS = 34.0  # HARD CAP you requested
 BENCH_FLOOR = 6.0
 
 # Recency blend weights
 MIN_REC_W = 0.70
 PM_REC_W = 0.30
 
-# DvP caps (tighter = more stable)
+# DvP caps
 DVP_CAP_LOW = 0.95
 DVP_CAP_HIGH = 1.05
 
@@ -68,9 +63,9 @@ GIST_SLATE = "slate.csv"
 GIST_DVP = "dvp.csv"
 GIST_OUT = "out.json"
 GIST_LOCKS = "locks.json"
+GIST_EXCLUDE = "exclude.json"   # NEW
 GIST_BASE = "base.csv"
 GIST_FINAL = "final.csv"
-
 
 # Team abbreviation normalization (Hashtag vs DK vs NBA)
 TEAM_ALIASES = {
@@ -88,7 +83,7 @@ TEAM_ALIASES = {
 # PAGE
 # ==========================
 st.set_page_config(layout="wide")
-st.title("DK NBA Optimizer — Stable + Fast + DvP + Late Swap Locks")
+st.title("DK NBA Optimizer — Stable + DvP (Manual CSV) + Late Swap Locks")
 
 
 # ==========================
@@ -118,10 +113,6 @@ def strip_suffix(name: str) -> str:
     if parts and parts[-1] in SUFFIXES:
         parts = parts[:-1]
     return " ".join(parts)
-
-def first_token(name: str) -> str:
-    parts = clean_name(name).split()
-    return parts[0] if parts else ""
 
 def parse_positions(p):
     return [x.strip().upper() for x in str(p).split("/") if x.strip()]
@@ -253,7 +244,6 @@ def gist_read(name):
     r.raise_for_status()
     return r.text
 
-# SAFE gist write (403 won't crash app)
 def gist_write(files):
     payload = {"files": {k: {"content": v} for k, v in files.items()}}
     try:
@@ -271,8 +261,8 @@ def gist_write(files):
             return False
         r.raise_for_status()
         return True
-    except requests.exceptions.RequestException as e:
-        st.warning(f"Gist write failed ({type(e).__name__}). Continuing without saving.")
+    except requests.exceptions.RequestException:
+        st.warning("Gist write failed. Continuing without saving.")
         return False
 
 
@@ -299,70 +289,61 @@ def league_player_df():
 
 def match_player_to_nba(slate_name, dk_team, nba_df):
     """
-    Safer matching:
-    - Try exact matches first
-    - If last-name collision, require strong first-name agreement
-    - Prefer team matches when possible
+    STRICT matching to prevent wrong-brother / same-last-name issues.
+    Rules:
+    - Prefer exact clean or exact stripped matches (team must match if provided)
+    - Otherwise require:
+        * team match (hard)
+        * last name match
+        * first name similarity >= 0.80
+    - If still ambiguous -> return None (ERR)
     """
     cn = clean_name(slate_name)
     sn = strip_suffix(slate_name)
     dk_team = norm_team(dk_team)
 
-    # 1) exact clean
-    exact = nba_df[nba_df["NBA_Name_clean"] == cn]
-    if not exact.empty:
-        if dk_team and (exact.iloc[0]["NBA_Team"] == dk_team):
-            return exact.iloc[0]
-        return exact.iloc[0]
+    def team_ok(dfsub):
+        if not dk_team:
+            return dfsub
+        return dfsub[dfsub["NBA_Team"] == dk_team]
 
-    # 2) exact stripped
-    exact2 = nba_df[nba_df["NBA_Name_stripped"] == sn]
-    if not exact2.empty:
-        if dk_team and (exact2.iloc[0]["NBA_Team"] == dk_team):
-            return exact2.iloc[0]
-        return exact2.iloc[0]
+    # 1) Exact clean
+    sub = nba_df[nba_df["NBA_Name_clean"] == cn].copy()
+    sub = team_ok(sub)
+    if len(sub) == 1:
+        return sub.iloc[0]
+    if len(sub) > 1:
+        return sub.iloc[0]
 
-    # 3) last name candidates
+    # 2) Exact stripped
+    sub = nba_df[nba_df["NBA_Name_stripped"] == sn].copy()
+    sub = team_ok(sub)
+    if len(sub) == 1:
+        return sub.iloc[0]
+
+    # 3) Strict last name + first name gate
     parts = sn.split()
-    if parts:
+    if len(parts) >= 2:
         first = parts[0]
         last = parts[-1]
+
         cand = nba_df[nba_df["NBA_Last"] == last].copy()
+        cand = team_ok(cand)
         if not cand.empty:
-            # Prefer team match if available
-            if dk_team:
-                cand_team = cand[cand["NBA_Team"] == dk_team]
-                if not cand_team.empty:
-                    cand = cand_team
+            cand["FIRST_SIM"] = cand["NBA_First"].apply(
+                lambda x: difflib.SequenceMatcher(None, first, str(x)).ratio()
+            )
+            cand = cand[cand["FIRST_SIM"] >= 0.80].copy()
+            if len(cand) == 1:
+                return cand.iloc[0]
 
-            # If multiple candidates share last name, require first-name similarity
-            best_row, best_score = None, 0.0
-            for _, row in cand.iterrows():
-                full_score = difflib.SequenceMatcher(None, sn, row["NBA_Name_stripped"]).ratio()
-                first_score = difflib.SequenceMatcher(None, first, row["NBA_First"]).ratio() if row["NBA_First"] else 0.0
-
-                # Guardrail: if first name doesn't match well, demand very high full score
-                if first_score < 0.70 and full_score < 0.93:
-                    continue
-
-                score = 0.65 * full_score + 0.35 * first_score
-                if score > best_score:
-                    best_row, best_score = row, score
-
-            if best_row is not None and best_score >= 0.78:
-                return best_row
-
-    # 4) close match on full clean list, with team preference
-    candidates = nba_df["NBA_Name_clean"].tolist()
-    hit = difflib.get_close_matches(cn, candidates, n=5, cutoff=0.90)
-    if hit:
-        sub = nba_df[nba_df["NBA_Name_clean"].isin(hit)].copy()
-        if dk_team and not sub[sub["NBA_Team"] == dk_team].empty:
-            sub = sub[sub["NBA_Team"] == dk_team]
-        # choose best similarity among remaining
-        sub["SIM"] = sub["NBA_Name_clean"].apply(lambda x: difflib.SequenceMatcher(None, cn, x).ratio())
-        sub = sub.sort_values("SIM", ascending=False)
-        return sub.iloc[0]
+            if len(cand) > 1:
+                cand["FULL_SIM"] = cand["NBA_Name_stripped"].apply(
+                    lambda x: difflib.SequenceMatcher(None, sn, str(x)).ratio()
+                )
+                cand = cand.sort_values(["FULL_SIM", "FIRST_SIM"], ascending=False)
+                if float(cand.iloc[0]["FULL_SIM"]) >= 0.92:
+                    return cand.iloc[0]
 
     return None
 
@@ -392,13 +373,11 @@ def gamelog_recent(pid: int, last_n: int):
 
 
 # ==========================
-# SIDEBAR: RELIABILITY MODE
+# SIDEBAR
 # ==========================
 st.sidebar.subheader("Reliability")
 deterministic_mode = st.sidebar.checkbox("Deterministic mode (freeze BASE)", value=True)
-st.sidebar.caption(
-    "When ON: Step B uses saved BASE only. Projections won't change unless you rebuild BASE or change OUT/locks/DvP."
-)
+st.sidebar.caption("When ON: Step B uses saved BASE only. Projections won't change unless you rebuild BASE or change OUT/locks/DvP.")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Recency Settings")
@@ -406,10 +385,6 @@ use_recency = st.sidebar.checkbox("Use recency blend (top salaries)", value=True
 top_n = st.sidebar.slider("Top N salaries to recency-blend", 0, 60, 25, 5)
 last_n_games = st.sidebar.slider("Recent games (N)", 3, 15, 10, 1)
 
-
-# ==========================
-# UPLOADS
-# ==========================
 st.sidebar.markdown("---")
 st.sidebar.subheader("Uploads")
 
@@ -461,11 +436,12 @@ slate["PrimaryPos"] = slate["Positions"].apply(primary_pos)
 slate["GameInfo"] = df[game_info_col].astype(str) if game_info_col else ""
 slate["Opp"] = slate.apply(lambda r: parse_opponent_from_gameinfo(r["Team"], r["GameInfo"]), axis=1)
 slate["Opp"] = slate["Opp"].apply(norm_team)
+
 teams_on_slate = sorted([t for t in slate["Team"].dropna().unique().tolist() if t and t != "NAN"])
 
 
 # ==========================
-# LOAD SAVED OUT + LOCKS
+# LOAD SAVED OUT + LOCKS + EXCLUDES
 # ==========================
 try:
     saved_out = json.loads(gist_read(GIST_OUT) or "{}")
@@ -477,18 +453,24 @@ try:
 except Exception:
     saved_locks = {}
 
+try:
+    saved_exclude = json.loads(gist_read(GIST_EXCLUDE) or "{}")
+except Exception:
+    saved_exclude = {}
+
 saved_locked_teams = set(saved_locks.get("locked_teams", []))
 saved_locked_players = set(saved_locks.get("locked_players", []))
 
 
 # ==========================
-# TOP: RUN SIGNATURE (so you can trust stability)
+# RUN SIGNATURE
 # ==========================
 base_text_for_sig = gist_read(GIST_BASE) or ""
 sig = {
     "slate": md5_text(slate_text),
     "base": md5_text(base_text_for_sig) if base_text_for_sig else "none",
     "out": md5_text(json.dumps(saved_out, sort_keys=True)) if saved_out else "none",
+    "exclude": md5_text(json.dumps(saved_exclude, sort_keys=True)) if saved_exclude else "none",
     "dvp": md5_text(dvp_text) if dvp_text else "none",
     "recency": f"use={use_recency},topN={top_n},lastN={last_n_games}",
     "caps": f"starter={STARTER_CAP},bench={BENCH_CAP},abs={MAX_MINUTES_ABS}",
@@ -498,7 +480,7 @@ with st.expander("Run Signature (helps explain why projections changed)", expand
 
 
 # ==========================
-# TEAM LOCK UI
+# LATE SWAP CONTROLS + TOP TABLE
 # ==========================
 st.subheader("Late Swap Controls")
 
@@ -512,37 +494,52 @@ slate["LOCK"] = slate["Team"].isin(set(locked_teams))
 slate["LOCK"] = slate.apply(lambda r: True if r["Name_clean"] in saved_locked_players else bool(r["LOCK"]), axis=1)
 slate["OUT"] = slate["Name_clean"].map(lambda x: bool(saved_out.get(x, False)))
 
+# NEW: EXCLUDE flag (optimizer only)
+slate["EXCLUDE"] = slate["Name_clean"].map(lambda x: bool(saved_exclude.get(x, False)))
+
+# EDIT: Salary moved directly after Name
 edited = st.data_editor(
-    slate[["OUT","LOCK","Name","Team","Opp","PrimaryPos","Salary","Positions"]],
+    slate[["OUT","LOCK","EXCLUDE","Name","Salary","Team","Opp","PrimaryPos","Positions"]],
     column_config={
         "OUT": st.column_config.CheckboxColumn("OUT"),
         "LOCK": st.column_config.CheckboxColumn("LOCK"),
+        "EXCLUDE": st.column_config.CheckboxColumn("EXCLUDE"),
+        "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
     },
-    disabled=["Name","Team","Opp","PrimaryPos","Salary","Positions"],
+    disabled=["Name","Salary","Team","Opp","PrimaryPos","Positions"],
     use_container_width=True,
     hide_index=True,
 )
 
 out_flags = {clean_name(r["Name"]): bool(r["OUT"]) for _, r in edited.iterrows()}
 out_set = {k for k, v in out_flags.items() if v}
+
 lock_flags = {clean_name(r["Name"]): bool(r["LOCK"]) for _, r in edited.iterrows()}
 locked_players_set = {k for k, v in lock_flags.items() if v}
 
-c1, c2 = st.columns(2)
+exclude_flags = {clean_name(r["Name"]): bool(r["EXCLUDE"]) for _, r in edited.iterrows()}
+excluded_players_set = {k for k, v in exclude_flags.items() if v}
+
+c1, c2, c3 = st.columns(3)
 with c1:
-    if st.button("Save OUT + LOCKS"):
+    if st.button("Save OUT + LOCKS + EXCLUDES"):
         gist_write({
             GIST_OUT: json.dumps(out_flags, indent=2),
             GIST_LOCKS: json.dumps({
                 "locked_teams": sorted(list(set(locked_teams))),
-                "locked_players": sorted(list(locked_players_set)),
+                "locked_players": sorted(list(set(locked_players_set))),
             }, indent=2),
+            GIST_EXCLUDE: json.dumps(exclude_flags, indent=2),
         })
-        st.success("Saved OUT + LOCKS")
+        st.success("Saved OUT + LOCKS + EXCLUDES")
 with c2:
     if st.button("Clear Locks"):
         gist_write({GIST_LOCKS: json.dumps({"locked_teams": [], "locked_players": []}, indent=2)})
         st.success("Cleared locks (refresh page)")
+with c3:
+    if st.button("Clear Excludes"):
+        gist_write({GIST_EXCLUDE: json.dumps({}, indent=2)})
+        st.success("Cleared excludes (refresh page)")
 
 
 # ==========================
@@ -616,7 +613,7 @@ if st.button("Build BASE", disabled=(deterministic_mode and not confirm_rebuild)
                 "Minutes": np.nan,
                 **{c: np.nan for c in STAT_COLS},
                 "Status": "ERR",
-                "Notes": "No match in league stats (name mismatch)",
+                "Notes": "No safe match in league stats",
                 "Matched_NBA_Name": "",
                 "Matched_NBA_Team": "",
             }
@@ -641,7 +638,6 @@ if st.button("Build BASE", disabled=(deterministic_mode and not confirm_rebuild)
             except Exception as e:
                 notes = f"RECENCY_FAIL: {str(e)[:80]}"
 
-        # Add debug so you can see if names are being matched incorrectly
         row = {
             **r.to_dict(),
             "Minutes": round(float(mins), 2),
@@ -652,7 +648,6 @@ if st.button("Build BASE", disabled=(deterministic_mode and not confirm_rebuild)
             "Matched_NBA_Team": str(hit["NBA_Team"]),
         }
 
-        # Guardrail: if team mismatches, mark ERR (prevents wrong stats on cheap slate guys)
         if r["Team"] and str(hit["NBA_Team"]) != str(r["Team"]):
             row["Status"] = "ERR"
             row["Notes"] = f"TEAM_MISMATCH (DK {r['Team']} vs NBA {hit['NBA_Team']})"
@@ -661,11 +656,12 @@ if st.button("Build BASE", disabled=(deterministic_mode and not confirm_rebuild)
 
     base = pd.DataFrame(rows)
     base["DK_FP"] = base.apply(lambda rr: dk_fp(rr) if rr["Status"] == "OK" else np.nan, axis=1)
-    base["BASE_Minutes"] = base["Minutes"]  # keep original minutes for caps/weights
+    base["BASE_Minutes"] = base["Minutes"]
     gist_write({GIST_BASE: base.to_csv(index=False)})
+
     st.success("Saved BASE")
     st.dataframe(
-        base[["Name","Team","Opp","PrimaryPos","Salary","Minutes","DK_FP","Status","Notes","Matched_NBA_Name","Matched_NBA_Team"]],
+        base[["Name","Salary","Team","Opp","PrimaryPos","Minutes","DK_FP","Status","Notes","Matched_NBA_Name","Matched_NBA_Team"]],
         use_container_width=True
     )
 
@@ -691,18 +687,18 @@ if st.button("Run Projections"):
     base["Notes"] = base.get("Notes", "").fillna("").astype(str)
 
     base["BumpNotes"] = ""
-    base["OppNotes"] = ""
     base["DvPNotes"] = ""
     base["DvPMult"] = 1.0
+    base["UsageNotes"] = ""
 
-    # Apply OUT flags (from editor state)
+    # Apply OUT flags
     base.loc[base["Name_clean"].isin(out_set), "Status"] = "OUT"
 
     # Make sure numeric
     for c in STAT_COLS:
         base[c] = pd.to_numeric(base[c], errors="coerce")
 
-    # Per-minute rates from BASE (before any bumps)
+    # Per-minute rates from BASE
     for c in STAT_COLS:
         base[f"PM_{c}"] = np.where(
             (base["Status"] == "OK") & (base["Minutes"].fillna(0) > 0),
@@ -711,7 +707,7 @@ if st.button("Run Projections"):
         )
         base[f"PM_{c}"] = base[f"PM_{c}"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    # Role-based cap per player (starter vs bench) + absolute cap
+    # Role-based cap + absolute cap
     def minute_cap(row):
         bm = float(row["BASE_Minutes"]) if pd.notna(row["BASE_Minutes"]) else 0.0
         cap_role = STARTER_CAP if bm >= STARTER_MIN_CUTOFF else BENCH_CAP
@@ -719,9 +715,7 @@ if st.button("Run Projections"):
 
     base["MIN_CAP"] = base.apply(minute_cap, axis=1)
 
-    # --------------------------
-    # 1) Minutes redistribution (fast)
-    # --------------------------
+    # 1) Minutes redistribution
     for team in base["Team"].dropna().unique():
         out_t = base[(base["Team"] == team) & (base["Status"] == "OUT")]
         ok_t = base[(base["Team"] == team) & (base["Status"] == "OK")]
@@ -732,7 +726,6 @@ if st.button("Run Projections"):
         if missing <= 0:
             continue
 
-        # Weight by baseline minutes (bench gets floor)
         weights = ok_t["BASE_Minutes"].fillna(0).clip(lower=BENCH_FLOOR)
         wsum = float(weights.sum())
         if wsum <= 0:
@@ -742,14 +735,16 @@ if st.button("Run Projections"):
             inc = missing * float(weights.loc[idx]) / wsum
             new_m = float(base.loc[idx, "Minutes"]) + inc
             cap = float(base.loc[idx, "MIN_CAP"])
+
             if new_m > cap:
                 inc = max(0.0, cap - float(base.loc[idx, "Minutes"]))
                 new_m = cap
+
             base.loc[idx, "Minutes"] = round(new_m, 2)
             if inc > 0:
                 base.loc[idx, "BumpNotes"] = (base.loc[idx, "BumpNotes"] + f" MIN+{inc:.1f}").strip()
 
-    # Recompute stats from per-minute using updated minutes (still fast)
+    # Recompute stats from per-minute using updated minutes
     for idx in base.index[base["Status"] == "OK"]:
         m = base.loc[idx, "Minutes"]
         if pd.isna(m) or float(m) <= 0:
@@ -757,11 +752,7 @@ if st.button("Run Projections"):
         for c in STAT_COLS:
             base.loc[idx, c] = round(float(base.loc[idx, f"PM_{c}"]) * float(m), 2)
 
-    # --------------------------
-    # 2) Opportunity redistribution (PTS/AST/FG3M/REB) (still fast, improves accuracy)
-    # --------------------------
-    base["UsageNotes"] = ""
-
+    # 2) Opportunity redistribution (PTS/AST/FG3M/REB)
     for team in base["Team"].dropna().unique():
         out_t = base[(base["Team"] == team) & (base["Status"] == "OUT")]
         ok_t = base[(base["Team"] == team) & (base["Status"] == "OK")]
@@ -774,15 +765,12 @@ if st.button("Run Projections"):
             "FG3M": float(out_t["FG3M"].fillna(0).sum()),
             "REB": float(out_t["REB"].fillna(0).sum()),
         }
-
-        # Only redistribute meaningful removed opportunity
         if sum(removed.values()) <= 0:
             continue
 
-        # Weights per category (proxy for role)
         w_pts = ok_t["PTS"].fillna(0).clip(lower=0.01)
         w_ast = ok_t["AST"].fillna(0).clip(lower=0.01)
-        w_3   = ok_t["FG3M"].fillna(0).clip(lower=0.01)
+        w_3 = ok_t["FG3M"].fillna(0).clip(lower=0.01)
         w_reb = ok_t["REB"].fillna(0).clip(lower=0.01)
 
         sums = {
@@ -792,9 +780,7 @@ if st.button("Run Projections"):
             "REB": float(w_reb.sum()),
         }
 
-        # apply redistribution with caps (percent caps vs current)
         for idx in ok_t.index:
-            # PTS
             if sums["PTS"] > 0 and removed["PTS"] > 0:
                 add = removed["PTS"] * (float(w_pts.loc[idx]) / sums["PTS"])
                 cap = float(base.loc[idx, "PTS"]) * BUMP_CAPS["PTS"]
@@ -803,7 +789,6 @@ if st.button("Run Projections"):
                     base.loc[idx, "PTS"] = round(float(base.loc[idx, "PTS"]) + add, 2)
                     base.loc[idx, "UsageNotes"] += f" PTS+{add:.1f}"
 
-            # AST
             if sums["AST"] > 0 and removed["AST"] > 0:
                 add = removed["AST"] * (float(w_ast.loc[idx]) / sums["AST"])
                 cap = float(base.loc[idx, "AST"]) * BUMP_CAPS["AST"]
@@ -812,7 +797,6 @@ if st.button("Run Projections"):
                     base.loc[idx, "AST"] = round(float(base.loc[idx, "AST"]) + add, 2)
                     base.loc[idx, "UsageNotes"] += f" AST+{add:.1f}"
 
-            # 3PM
             if sums["FG3M"] > 0 and removed["FG3M"] > 0:
                 add = removed["FG3M"] * (float(w_3.loc[idx]) / sums["FG3M"])
                 cap = float(base.loc[idx, "FG3M"]) * BUMP_CAPS["FG3M"]
@@ -821,7 +805,6 @@ if st.button("Run Projections"):
                     base.loc[idx, "FG3M"] = round(float(base.loc[idx, "FG3M"]) + add, 2)
                     base.loc[idx, "UsageNotes"] += f" 3PM+{add:.1f}"
 
-            # REB
             if sums["REB"] > 0 and removed["REB"] > 0:
                 add = removed["REB"] * (float(w_reb.loc[idx]) / sums["REB"])
                 cap = float(base.loc[idx, "REB"]) * BUMP_CAPS["REB"]
@@ -830,12 +813,9 @@ if st.button("Run Projections"):
                     base.loc[idx, "REB"] = round(float(base.loc[idx, "REB"]) + add, 2)
                     base.loc[idx, "UsageNotes"] += f" REB+{add:.1f}"
 
-        # clean notes spacing
-        base["UsageNotes"] = base["UsageNotes"].fillna("").astype(str).str.strip()
+    base["UsageNotes"] = base["UsageNotes"].fillna("").astype(str).str.strip()
 
-    # --------------------------
-    # 3) Apply DvP vs opponent by position (light-touch)
-    # --------------------------
+    # 3) Apply DvP
     if dvp_pack is not None:
         dvp_df, league_avg = dvp_pack
         dvp_key = {(rr["TEAM"], rr["POS"]): rr for _, rr in dvp_df.iterrows()}
@@ -874,14 +854,14 @@ if st.button("Run Projections"):
     # DK FP
     base.loc[base["Status"] == "OK", "DK_FP"] = base[base["Status"] == "OK"].apply(dk_fp, axis=1)
 
-    # Remove OUT from displayed pool
+    # Display pool excludes OUT only (EXCLUDE is optimizer-only)
     final = base[(base["Status"] == "OK") & (~base["Name_clean"].isin(out_set))].copy()
 
     gist_write({GIST_FINAL: final.to_csv(index=False)})
     st.success("Saved FINAL")
 
     show_cols = [
-        "Name","Team","Opp","PrimaryPos","Salary","Minutes","MIN_CAP",
+        "Name","Salary","Team","Opp","PrimaryPos","Minutes","MIN_CAP",
         "PTS","REB","AST","FG3M","STL","BLK","TOV","DK_FP",
         "Notes","BumpNotes","UsageNotes","DvPNotes"
     ]
@@ -940,8 +920,16 @@ def assign_locked_to_slots(locked_df):
 if st.button("Optimize (respect locks)"):
     locked_df = pool[pool["Name_clean"].isin(locked_players_set)].copy()
 
-    # Exclude started teams from NEW selections (but keep locked players even if started)
+    # Exclude players from optimizer pool (but never exclude players you LOCKED)
+    excluded_effective = set(excluded_players_set) - set(locked_players_set)
+
     candidate_df = pool.copy()
+
+    # Apply EXCLUDE first
+    if excluded_effective:
+        candidate_df = candidate_df[~candidate_df["Name_clean"].isin(excluded_effective)].copy()
+
+    # Exclude started teams from NEW selections (but keep locked players even if started)
     if started_teams:
         candidate_df = candidate_df[~candidate_df["Team"].isin(started_teams)].copy()
         candidate_df = pd.concat([candidate_df, locked_df], axis=0).drop_duplicates(subset=["Name_clean"])
@@ -989,7 +977,7 @@ if st.button("Optimize (respect locks)"):
                 x[(i, slot)] = LpVariable(f"x_{i}_{slot}", 0, 1, LpBinary)
 
     if not x:
-        st.error("No feasible candidates for remaining slots (too many teams locked / too many players out).")
+        st.error("No feasible candidates for remaining slots (too many teams locked / too many players out / too many excluded).")
         st.stop()
 
     prob += lpSum(opt_pool.loc[i, "DK_FP"] * x[(i, slot)] for (i, slot) in x)
@@ -1033,3 +1021,6 @@ if st.button("Optimize (respect locks)"):
 
     if started_teams:
         st.caption(f"Started/locked teams excluded from NEW selections: {', '.join(sorted(list(started_teams)))}")
+
+    if excluded_effective:
+        st.caption(f"Excluded from optimizer pool: {len(excluded_effective)} player(s)")
