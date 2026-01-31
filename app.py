@@ -3,6 +3,8 @@
 # Edits INCLUDED:
 #   1) Top table column order: Salary immediately after Name
 #   2) EXCLUDE checkbox + Save/Load to remove players from OPTIMIZER pool (still in projections)
+#   3) FIX: "Teams started" no longer auto-locks players into lineup
+#   4) NEW: "Exclude teams from optimizer pool" (does NOT lock players)
 # ==========================
 
 import json
@@ -39,7 +41,7 @@ GAMELOG_RETRIES = 2
 STARTER_MIN_CUTOFF = 28.0
 STARTER_CAP = 36.0
 BENCH_CAP = 32.0
-MAX_MINUTES_ABS = 34.0  # HARD CAP you requested
+MAX_MINUTES_ABS = 34.0  # HARD CAP
 BENCH_FLOOR = 6.0
 
 # Recency blend weights
@@ -63,7 +65,7 @@ GIST_SLATE = "slate.csv"
 GIST_DVP = "dvp.csv"
 GIST_OUT = "out.json"
 GIST_LOCKS = "locks.json"
-GIST_EXCLUDE = "exclude.json"   # NEW
+GIST_EXCLUDE = "exclude.json"
 GIST_BASE = "base.csv"
 GIST_FINAL = "final.csv"
 
@@ -197,10 +199,6 @@ def parse_opponent_from_gameinfo(team_abbrev: str, game_info: str):
     return None
 
 def _to_float_first_token(val):
-    """
-    DvP cells look like: "21.0   21" or "3.5  10"
-    Return first float found in the string.
-    """
     if pd.isna(val):
         return np.nan
     s = str(val).replace("\xa0", " ").strip()
@@ -210,9 +208,6 @@ def _to_float_first_token(val):
     return float(m.group(0))
 
 def _team_first_token(val):
-    """
-    Team cells look like: 'OKC   1' (team + rank).
-    """
     if pd.isna(val):
         return ""
     s = str(val).replace("\xa0", " ").strip().upper()
@@ -288,16 +283,6 @@ def league_player_df():
     return df
 
 def match_player_to_nba(slate_name, dk_team, nba_df):
-    """
-    STRICT matching to prevent wrong-brother / same-last-name issues.
-    Rules:
-    - Prefer exact clean or exact stripped matches (team must match if provided)
-    - Otherwise require:
-        * team match (hard)
-        * last name match
-        * first name similarity >= 0.80
-    - If still ambiguous -> return None (ERR)
-    """
     cn = clean_name(slate_name)
     sn = strip_suffix(slate_name)
     dk_team = norm_team(dk_team)
@@ -458,8 +443,8 @@ try:
 except Exception:
     saved_exclude = {}
 
-saved_locked_teams = set(saved_locks.get("locked_teams", []))
-saved_locked_players = set(saved_locks.get("locked_players", []))
+saved_locked_teams = set(saved_locks.get("locked_teams", []))          # Teams started / late-swap lock
+saved_locked_players = set(saved_locks.get("locked_players", []))      # Player LOCKs
 
 
 # ==========================
@@ -484,20 +469,33 @@ with st.expander("Run Signature (helps explain why projections changed)", expand
 # ==========================
 st.subheader("Late Swap Controls")
 
+# IMPORTANT:
+# - "Teams started" should NOT auto-LOCK players.
+# - It only excludes those teams from NEW optimizer selections.
 locked_teams = st.multiselect(
-    "Teams started / lock all players",
+    "Teams started (exclude from NEW optimizer selections)",
     teams_on_slate,
     default=[t for t in teams_on_slate if t in saved_locked_teams]
 )
 
-slate["LOCK"] = slate["Team"].isin(set(locked_teams))
-slate["LOCK"] = slate.apply(lambda r: True if r["Name_clean"] in saved_locked_players else bool(r["LOCK"]), axis=1)
+# NEW:
+# - "Exclude teams" removes those teams from optimizer pool entirely (still shows in projections)
+exclude_teams = st.multiselect(
+    "Exclude teams from optimizer pool (do NOT lock them)",
+    teams_on_slate,
+    default=[]
+)
+
+# Player-level flags
 slate["OUT"] = slate["Name_clean"].map(lambda x: bool(saved_out.get(x, False)))
 
-# NEW: EXCLUDE flag (optimizer only)
+# FIX: LOCK is player-level only (do NOT auto-lock by team)
+slate["LOCK"] = slate["Name_clean"].map(lambda x: bool(x in saved_locked_players))
+
+# Optimizer-only exclude (player-level)
 slate["EXCLUDE"] = slate["Name_clean"].map(lambda x: bool(saved_exclude.get(x, False)))
 
-# EDIT: Salary moved directly after Name
+# Salary moved directly after Name
 edited = st.data_editor(
     slate[["OUT","LOCK","EXCLUDE","Name","Salary","Team","Opp","PrimaryPos","Positions"]],
     column_config={
@@ -526,7 +524,9 @@ with c1:
         gist_write({
             GIST_OUT: json.dumps(out_flags, indent=2),
             GIST_LOCKS: json.dumps({
+                # keep saving teams started here (late swap)
                 "locked_teams": sorted(list(set(locked_teams))),
+                # player locks from checkboxes
                 "locked_players": sorted(list(set(locked_players_set))),
             }, indent=2),
             GIST_EXCLUDE: json.dumps(exclude_flags, indent=2),
@@ -890,6 +890,7 @@ if "Name_clean" not in pool.columns:
     pool["Name_clean"] = pool["Name"].apply(clean_name)
 
 started_teams = set(locked_teams)
+excluded_teams_set = set(exclude_teams)
 
 def assign_locked_to_slots(locked_df):
     players = list(locked_df.index)
@@ -925,13 +926,20 @@ if st.button("Optimize (respect locks)"):
 
     candidate_df = pool.copy()
 
-    # Apply EXCLUDE first
+    # 1) Exclude TEAMS from optimizer pool (does NOT lock them)
+    if excluded_teams_set:
+        candidate_df = candidate_df[~candidate_df["Team"].isin(excluded_teams_set)].copy()
+
+    # 2) Exclude PLAYERs from optimizer pool
     if excluded_effective:
         candidate_df = candidate_df[~candidate_df["Name_clean"].isin(excluded_effective)].copy()
 
-    # Exclude started teams from NEW selections (but keep locked players even if started)
+    # 3) Late swap: exclude started teams from NEW selections (but keep locked players)
     if started_teams:
         candidate_df = candidate_df[~candidate_df["Team"].isin(started_teams)].copy()
+
+    # Always re-add locked players so they remain eligible even if team was excluded/started
+    if not locked_df.empty:
         candidate_df = pd.concat([candidate_df, locked_df], axis=0).drop_duplicates(subset=["Name_clean"])
 
     locked_assignment = {}
@@ -1020,7 +1028,8 @@ if st.button("Optimize (respect locks)"):
     st.metric("Total DK FP", round(float(lineup_df["DK_FP"].sum()), 2))
 
     if started_teams:
-        st.caption(f"Started/locked teams excluded from NEW selections: {', '.join(sorted(list(started_teams)))}")
-
+        st.caption(f"Started teams excluded from NEW selections: {', '.join(sorted(list(started_teams)))}")
+    if excluded_teams_set:
+        st.caption(f"Teams excluded from optimizer pool: {', '.join(sorted(list(excluded_teams_set)))}")
     if excluded_effective:
-        st.caption(f"Excluded from optimizer pool: {len(excluded_effective)} player(s)")
+        st.caption(f"Excluded players from optimizer pool: {len(excluded_effective)} player(s)")
