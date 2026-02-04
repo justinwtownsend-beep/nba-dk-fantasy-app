@@ -1,10 +1,8 @@
 # ==========================
 # DraftKings NBA Optimizer — Stable + Fast + DvP (Manual CSV) + Late Swap Locks
-# Edits INCLUDED:
-#   1) Top table column order: Salary immediately after Name
-#   2) EXCLUDE checkbox + Save/Load to remove players from OPTIMIZER pool (still in projections)
-#   3) FIX: "Teams started" no longer auto-locks players into lineup
-#   4) NEW: "Exclude teams from optimizer pool" (does NOT lock players)
+# + Player EXCLUDE (optimizer-only)
+# + Team Exclude (optimizer-only; does NOT lock players)
+# + Props module (Top 15 projected by PTS/REB/AST/FG3M) with 70/80/90% bands + optional P(Over/Under)
 # ==========================
 
 import json
@@ -14,6 +12,7 @@ import time
 import re
 import hashlib
 from io import StringIO
+from math import erf, sqrt
 
 import numpy as np
 import pandas as pd
@@ -59,6 +58,12 @@ BUMP_CAPS = {
     "FG3M": 0.20,  # +20%
     "REB": 0.12,   # +12%
 }
+
+# --- Props config ---
+PROPS_TOPK_PER_STAT = 15  # you requested top 15 per stat
+VOL_LAST_N = 15
+VOL_TIMEOUT = 12
+VOL_RETRIES = 2
 
 # Gist files
 GIST_SLATE = "slate.csv"
@@ -213,6 +218,16 @@ def _team_first_token(val):
     s = str(val).replace("\xa0", " ").strip().upper()
     return s.split()[0] if s else ""
 
+# --- Normal distribution helpers for props ---
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+
+def z_for_two_sided(conf: float) -> float:
+    # two-sided z (approx)
+    if conf >= 0.90: return 1.645
+    if conf >= 0.80: return 1.282
+    return 1.036
+
 
 # ==========================
 # GIST
@@ -283,6 +298,9 @@ def league_player_df():
     return df
 
 def match_player_to_nba(slate_name, dk_team, nba_df):
+    """
+    Stricter matching to avoid wrong-brother / same-last-name issues.
+    """
     cn = clean_name(slate_name)
     sn = strip_suffix(slate_name)
     dk_team = norm_team(dk_team)
@@ -306,7 +324,7 @@ def match_player_to_nba(slate_name, dk_team, nba_df):
     if len(sub) == 1:
         return sub.iloc[0]
 
-    # 3) Strict last name + first name gate
+    # 3) Last + first similarity gate
     parts = sn.split()
     if len(parts) >= 2:
         first = parts[0]
@@ -355,6 +373,43 @@ def gamelog_recent(pid: int, last_n: int):
             last_err = str(e)
             time.sleep(0.4 * attempt)
     raise RuntimeError(f"RECENT_GAMELOG_FAIL: {last_err}")
+
+@st.cache_data(ttl=900)
+def gamelog_volatility(pid: int, last_n: int):
+    """
+    Returns std dev for PTS/REB/AST/FG3M from last_n games,
+    plus mean minutes from those games (for minutes-adjustment).
+    """
+    last_err = None
+    for attempt in range(1, VOL_RETRIES + 1):
+        try:
+            gl = playergamelog.PlayerGameLog(
+                player_id=int(pid),
+                season=SEASON,
+                timeout=VOL_TIMEOUT
+            ).get_data_frames()[0]
+            gl = gl.head(int(last_n)).copy()
+            if gl.empty:
+                raise RuntimeError("EMPTY_GAMELOG")
+
+            gl["MIN_f"] = gl["MIN"].apply(parse_minutes_min)
+            gl = gl[gl["MIN_f"].fillna(0) > 0].copy()
+            if gl.empty:
+                raise RuntimeError("NO_VALID_MINUTES")
+
+            stds = {
+                "PTS": float(gl["PTS"].std(ddof=1)) if len(gl) > 1 else 0.0,
+                "REB": float(gl["REB"].std(ddof=1)) if len(gl) > 1 else 0.0,
+                "AST": float(gl["AST"].std(ddof=1)) if len(gl) > 1 else 0.0,
+                "FG3M": float(gl["FG3M"].std(ddof=1)) if len(gl) > 1 else 0.0,
+            }
+            mean_min = float(gl["MIN_f"].mean())
+            return stds, mean_min
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(0.35 * attempt)
+
+    raise RuntimeError(f"VOL_FAIL: {last_err}")
 
 
 # ==========================
@@ -443,8 +498,8 @@ try:
 except Exception:
     saved_exclude = {}
 
-saved_locked_teams = set(saved_locks.get("locked_teams", []))          # Teams started / late-swap lock
-saved_locked_players = set(saved_locks.get("locked_players", []))      # Player LOCKs
+saved_locked_teams = set(saved_locks.get("locked_teams", []))          # Teams started / late swap
+saved_locked_players = set(saved_locks.get("locked_players", []))      # Player locks
 
 
 # ==========================
@@ -469,17 +524,14 @@ with st.expander("Run Signature (helps explain why projections changed)", expand
 # ==========================
 st.subheader("Late Swap Controls")
 
-# IMPORTANT:
-# - "Teams started" should NOT auto-LOCK players.
-# - It only excludes those teams from NEW optimizer selections.
+# "Teams started" = exclude from NEW optimizer selections (late swap control)
 locked_teams = st.multiselect(
     "Teams started (exclude from NEW optimizer selections)",
     teams_on_slate,
     default=[t for t in teams_on_slate if t in saved_locked_teams]
 )
 
-# NEW:
-# - "Exclude teams" removes those teams from optimizer pool entirely (still shows in projections)
+# Team exclude = remove from optimizer pool (does NOT lock players)
 exclude_teams = st.multiselect(
     "Exclude teams from optimizer pool (do NOT lock them)",
     teams_on_slate,
@@ -489,7 +541,7 @@ exclude_teams = st.multiselect(
 # Player-level flags
 slate["OUT"] = slate["Name_clean"].map(lambda x: bool(saved_out.get(x, False)))
 
-# FIX: LOCK is player-level only (do NOT auto-lock by team)
+# LOCK is player-level only (no team auto-lock)
 slate["LOCK"] = slate["Name_clean"].map(lambda x: bool(x in saved_locked_players))
 
 # Optimizer-only exclude (player-level)
@@ -497,14 +549,14 @@ slate["EXCLUDE"] = slate["Name_clean"].map(lambda x: bool(saved_exclude.get(x, F
 
 # Salary moved directly after Name
 edited = st.data_editor(
-    slate[["OUT","LOCK","EXCLUDE","Name","Salary","Team","Opp","PrimaryPos","Positions"]],
+    slate[["OUT", "LOCK", "EXCLUDE", "Name", "Salary", "Team", "Opp", "PrimaryPos", "Positions"]],
     column_config={
         "OUT": st.column_config.CheckboxColumn("OUT"),
         "LOCK": st.column_config.CheckboxColumn("LOCK"),
         "EXCLUDE": st.column_config.CheckboxColumn("EXCLUDE"),
         "Salary": st.column_config.NumberColumn("Salary", format="$%d"),
     },
-    disabled=["Name","Salary","Team","Opp","PrimaryPos","Positions"],
+    disabled=["Name", "Salary", "Team", "Opp", "PrimaryPos", "Positions"],
     use_container_width=True,
     hide_index=True,
 )
@@ -524,9 +576,7 @@ with c1:
         gist_write({
             GIST_OUT: json.dumps(out_flags, indent=2),
             GIST_LOCKS: json.dumps({
-                # keep saving teams started here (late swap)
                 "locked_teams": sorted(list(set(locked_teams))),
-                # player locks from checkboxes
                 "locked_players": sorted(list(set(locked_players_set))),
             }, indent=2),
             GIST_EXCLUDE: json.dumps(exclude_flags, indent=2),
@@ -550,7 +600,7 @@ def load_dvp_book1(text: str):
         return None, None
 
     dvp = pd.read_csv(StringIO(text))
-    required = ["Sort: Position","Sort: Team","Sort: PTS","Sort: 3PM","Sort: REB","Sort: AST","Sort: STL","Sort: BLK","Sort: TO"]
+    required = ["Sort: Position", "Sort: Team", "Sort: PTS", "Sort: 3PM", "Sort: REB", "Sort: AST", "Sort: STL", "Sort: BLK", "Sort: TO"]
     missing = [c for c in required if c not in dvp.columns]
     if missing:
         return None, f"DvP CSV missing columns: {missing}"
@@ -567,10 +617,10 @@ def load_dvp_book1(text: str):
     out["BLK"] = dvp["Sort: BLK"].apply(_to_float_first_token)
     out["TOV"] = dvp["Sort: TO"].apply(_to_float_first_token)
 
-    out = out.dropna(subset=["TEAM","POS","PTS","FG3M","REB","AST","STL","BLK","TOV"]).copy()
+    out = out.dropna(subset=["TEAM", "POS", "PTS", "FG3M", "REB", "AST", "STL", "BLK", "TOV"]).copy()
     out = out[(out["TEAM"] != "") & (out["POS"] != "")].copy()
 
-    league_avg = out.groupby("POS")[["PTS","REB","AST","FG3M","STL","BLK","TOV"]].mean().reset_index()
+    league_avg = out.groupby("POS")[["PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV"]].mean().reset_index()
     return (out, league_avg), None
 
 dvp_pack = None
@@ -661,7 +711,7 @@ if st.button("Build BASE", disabled=(deterministic_mode and not confirm_rebuild)
 
     st.success("Saved BASE")
     st.dataframe(
-        base[["Name","Salary","Team","Opp","PrimaryPos","Minutes","DK_FP","Status","Notes","Matched_NBA_Name","Matched_NBA_Team"]],
+        base[["Name", "Salary", "Team", "Opp", "PrimaryPos", "Minutes", "DK_FP", "Status", "Notes", "Matched_NBA_Name", "Matched_NBA_Team"]],
         use_container_width=True
     )
 
@@ -694,7 +744,7 @@ if st.button("Run Projections"):
     # Apply OUT flags
     base.loc[base["Name_clean"].isin(out_set), "Status"] = "OUT"
 
-    # Make sure numeric
+    # Numeric
     for c in STAT_COLS:
         base[c] = pd.to_numeric(base[c], errors="coerce")
 
@@ -815,7 +865,7 @@ if st.button("Run Projections"):
 
     base["UsageNotes"] = base["UsageNotes"].fillna("").astype(str).str.strip()
 
-    # 3) Apply DvP
+    # 3) Apply DvP vs opponent by position
     if dvp_pack is not None:
         dvp_df, league_avg = dvp_pack
         dvp_key = {(rr["TEAM"], rr["POS"]): rr for _, rr in dvp_df.iterrows()}
@@ -836,13 +886,13 @@ if st.button("Run Projections"):
             avg = avg_key[pos]
 
             mults = {}
-            for c in ["PTS","REB","AST","FG3M","STL","BLK","TOV"]:
+            for c in ["PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV"]:
                 av = float(avg[c])
                 al = float(allowed[c])
                 mlt = (al / av) if av > 0 else 1.0
                 mults[c] = clamp(mlt, DVP_CAP_LOW, DVP_CAP_HIGH)
 
-            for c in ["PTS","REB","AST","FG3M","STL","BLK","TOV"]:
+            for c in ["PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV"]:
                 base.loc[idx, c] = round(float(base.loc[idx, c]) * mults[c], 2)
 
             base.loc[idx, "DvPMult"] = round(float(np.mean(list(mults.values()))), 4)
@@ -854,16 +904,16 @@ if st.button("Run Projections"):
     # DK FP
     base.loc[base["Status"] == "OK", "DK_FP"] = base[base["Status"] == "OK"].apply(dk_fp, axis=1)
 
-    # Display pool excludes OUT only (EXCLUDE is optimizer-only)
+    # FINAL = OK and not OUT
     final = base[(base["Status"] == "OK") & (~base["Name_clean"].isin(out_set))].copy()
 
     gist_write({GIST_FINAL: final.to_csv(index=False)})
     st.success("Saved FINAL")
 
     show_cols = [
-        "Name","Salary","Team","Opp","PrimaryPos","Minutes","MIN_CAP",
-        "PTS","REB","AST","FG3M","STL","BLK","TOV","DK_FP",
-        "Notes","BumpNotes","UsageNotes","DvPNotes"
+        "Name", "Salary", "Team", "Opp", "PrimaryPos", "Minutes", "MIN_CAP",
+        "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV", "DK_FP",
+        "Notes", "BumpNotes", "UsageNotes", "DvPNotes"
     ]
     st.dataframe(final[show_cols], use_container_width=True)
 
@@ -872,7 +922,7 @@ if st.button("Run Projections"):
 # OPTIMIZER (LATE SWAP)
 # ==========================
 st.divider()
-st.subheader("Optimizer (Late Swap — respects Team Locks + Player LOCK)")
+st.subheader("Optimizer (Late Swap — respects Team Started + Player LOCK)")
 
 final_text = gist_read(GIST_FINAL)
 if not final_text:
@@ -883,7 +933,7 @@ pool = pd.read_csv(StringIO(final_text))
 pool["Positions"] = pool["Positions"].apply(eval)
 pool["Salary"] = pd.to_numeric(pool["Salary"], errors="coerce")
 pool["DK_FP"] = pd.to_numeric(pool["DK_FP"], errors="coerce")
-pool = pool.dropna(subset=["Salary","DK_FP"]).copy()
+pool = pool.dropna(subset=["Salary", "DK_FP"]).copy()
 pool = pool[pool["Salary"] > 0].copy()
 
 if "Name_clean" not in pool.columns:
@@ -894,7 +944,7 @@ excluded_teams_set = set(exclude_teams)
 
 def assign_locked_to_slots(locked_df):
     players = list(locked_df.index)
-    cand = {i: [s for s in DK_SLOTS if eligible_for_slot(locked_df.loc[i,"Positions"], s)] for i in players}
+    cand = {i: [s for s in DK_SLOTS if eligible_for_slot(locked_df.loc[i, "Positions"], s)] for i in players}
     players_sorted = sorted(players, key=lambda i: len(cand[i]))
 
     used_slots = set()
@@ -909,7 +959,7 @@ def assign_locked_to_slots(locked_df):
                 continue
             used_slots.add(s)
             assignment[s] = i
-            if backtrack(k+1):
+            if backtrack(k + 1):
                 return True
             used_slots.remove(s)
             assignment.pop(s, None)
@@ -934,7 +984,7 @@ if st.button("Optimize (respect locks)"):
     if excluded_effective:
         candidate_df = candidate_df[~candidate_df["Name_clean"].isin(excluded_effective)].copy()
 
-    # 3) Late swap: exclude started teams from NEW selections (but keep locked players)
+    # 3) Late swap: exclude started teams from NEW selections
     if started_teams:
         candidate_df = candidate_df[~candidate_df["Team"].isin(started_teams)].copy()
 
@@ -968,12 +1018,12 @@ if st.button("Optimize (respect locks)"):
             row["Locked"] = True
             lineup.append(row)
         lineup_df = pd.DataFrame(lineup).sort_values("Slot")
-        st.dataframe(lineup_df[["Slot","Locked","Name","Team","Salary","DK_FP","Minutes"]], use_container_width=True)
+        st.dataframe(lineup_df[["Slot", "Locked", "Name", "Team", "Salary", "DK_FP", "Minutes"]], use_container_width=True)
         st.metric("Total Salary", int(salary_locked))
         st.metric("Total DK FP", round(float(lineup_df["DK_FP"].sum()), 2))
         st.stop()
 
-    # only optimize over non-locked players
+    # Optimize over non-locked players
     opt_pool = candidate_df[~candidate_df["Name_clean"].isin(locked_players_set)].copy()
 
     prob = LpProblem("DK_LATE_SWAP", LpMaximize)
@@ -985,7 +1035,7 @@ if st.button("Optimize (respect locks)"):
                 x[(i, slot)] = LpVariable(f"x_{i}_{slot}", 0, 1, LpBinary)
 
     if not x:
-        st.error("No feasible candidates for remaining slots (too many teams locked / too many players out / too many excluded).")
+        st.error("No feasible candidates (too many teams started/excluded/players excluded).")
         st.stop()
 
     prob += lpSum(opt_pool.loc[i, "DK_FP"] * x[(i, slot)] for (i, slot) in x)
@@ -1023,7 +1073,7 @@ if st.button("Optimize (respect locks)"):
         lineup.append(row)
 
     lineup_df = pd.DataFrame(lineup).sort_values("Slot")
-    st.dataframe(lineup_df[["Slot","Locked","Name","Team","Salary","Minutes","DK_FP"]], use_container_width=True)
+    st.dataframe(lineup_df[["Slot", "Locked", "Name", "Team", "Salary", "Minutes", "DK_FP"]], use_container_width=True)
     st.metric("Total Salary", int(lineup_df["Salary"].sum()))
     st.metric("Total DK FP", round(float(lineup_df["DK_FP"].sum()), 2))
 
@@ -1033,3 +1083,164 @@ if st.button("Optimize (respect locks)"):
         st.caption(f"Teams excluded from optimizer pool: {', '.join(sorted(list(excluded_teams_set)))}")
     if excluded_effective:
         st.caption(f"Excluded players from optimizer pool: {len(excluded_effective)} player(s)")
+
+
+# ==========================
+# PROPS MODULE (Top 15 projected by PTS/REB/AST/FG3M)
+# ==========================
+st.divider()
+st.subheader("Props (Top 15 by Stat) — 70/80/90% confidence + optional P(Over/Under)")
+
+# Pull FINAL
+final_text = gist_read(GIST_FINAL)
+if not final_text:
+    st.info("Run Step B first to create FINAL projections.")
+    st.stop()
+
+final_df = pd.read_csv(StringIO(final_text))
+final_df["Name_clean"] = final_df["Name"].astype(str).apply(clean_name)
+
+for c in ["Minutes", "PTS", "REB", "AST", "FG3M", "Salary"]:
+    if c in final_df.columns:
+        final_df[c] = pd.to_numeric(final_df[c], errors="coerce")
+
+# Top 15 per stat based on projections
+stat_list = ["PTS", "REB", "AST", "FG3M"]
+top_sets = []
+for stat in stat_list:
+    topk = final_df.dropna(subset=[stat]).sort_values(stat, ascending=False).head(PROPS_TOPK_PER_STAT)
+    top_sets.append(topk[["Name", "Name_clean", "Team", "Minutes", stat]].copy())
+
+props_pool = pd.concat(top_sets, axis=0).drop_duplicates(subset=["Name_clean"]).copy()
+props_pool = props_pool.dropna(subset=["Minutes"]).copy()
+
+st.caption(
+    f"Volatility computed for union of top {PROPS_TOPK_PER_STAT} projected players in each stat "
+    f"(PTS/REB/AST/3PM). Total players: {len(props_pool)}"
+)
+
+# Optional upload of prop lines
+props_file = st.file_uploader(
+    "Upload Props CSV (optional) with columns: Name, Market (PTS/REB/AST/3PM), Line",
+    type="csv",
+    key="props_upload"
+)
+
+props_lines = None
+if props_file:
+    props_lines = pd.read_csv(props_file)
+    props_lines.columns = [str(c).strip() for c in props_lines.columns]
+    needed = {"Name", "Market", "Line"}
+    if not needed.issubset(set(props_lines.columns)):
+        st.error(f"Props CSV missing columns. Need: {sorted(list(needed))}")
+        props_lines = None
+    else:
+        props_lines["Name_clean"] = props_lines["Name"].astype(str).apply(clean_name)
+        props_lines["Market"] = props_lines["Market"].astype(str).str.upper().str.strip()
+        props_lines["Line"] = pd.to_numeric(props_lines["Line"], errors="coerce")
+
+conf_levels = st.multiselect("Confidence levels", [0.70, 0.80, 0.90], default=[0.70, 0.80, 0.90])
+use_lines = st.checkbox("If props CSV uploaded, compute P(Over/Under) vs the line", value=True)
+
+if st.button("Build Prop Table"):
+    nba_df = league_player_df()
+    prog = st.progress(0, text="Computing volatility (recent game logs)...")
+
+    out_rows = []
+    props_pool_reset = props_pool.reset_index(drop=True)
+
+    for i, r in props_pool_reset.iterrows():
+        prog.progress((i + 1) / len(props_pool_reset), text=f"Volatility: {r['Name']} ({i+1}/{len(props_pool_reset)})")
+
+        hit = match_player_to_nba(r["Name"], r["Team"], nba_df)
+        if hit is None:
+            continue
+
+        pid = int(hit["PLAYER_ID"])
+        try:
+            stds_raw, mean_min_hist = gamelog_volatility(pid, VOL_LAST_N)
+        except Exception:
+            continue
+
+        proj_min = float(r["Minutes"]) if pd.notna(r["Minutes"]) else 0.0
+        if proj_min <= 0:
+            continue
+
+        # minutes-adjust std: sigma * sqrt(proj_min / hist_mean_min)
+        scale = sqrt(max(0.25, proj_min / max(1.0, mean_min_hist)))
+
+        # Build rows for each stat using FINAL means
+        row_base = final_df[final_df["Name_clean"] == r["Name_clean"]].head(1)
+        if row_base.empty:
+            continue
+        row_base = row_base.iloc[0]
+
+        for stat in ["PTS", "REB", "AST", "FG3M"]:
+            mu = float(row_base.get(stat, np.nan))
+            if not np.isfinite(mu):
+                continue
+
+            sigma = float(stds_raw.get(stat, 0.0)) * float(scale)
+            sigma = max(0.5, sigma)  # floor keeps intervals reasonable
+
+            row = {
+                "Name": row_base["Name"],
+                "Team": row_base.get("Team", ""),
+                "Minutes": round(float(row_base.get("Minutes", proj_min)), 2),
+                "Stat": stat if stat != "FG3M" else "3PM",
+                "Mean": round(mu, 2),
+                "Sigma": round(sigma, 2),
+            }
+
+            for conf in conf_levels:
+                z = z_for_two_sided(float(conf))
+                lo = mu - z * sigma
+                hi = mu + z * sigma
+                row[f"{int(conf*100)}%_Low"] = round(lo, 2)
+                row[f"{int(conf*100)}%_High"] = round(hi, 2)
+
+            out_rows.append(row)
+
+    props_out = pd.DataFrame(out_rows)
+    if props_out.empty:
+        st.warning("No prop rows generated (name matching/volatility may have failed).")
+        st.stop()
+
+    # If props lines uploaded, compute probabilities vs line
+    if (props_lines is not None) and use_lines:
+        m = props_lines.dropna(subset=["Line"]).copy()
+
+        market_map = {"PTS": "PTS", "REB": "REB", "AST": "AST", "3PM": "3PM", "FG3M": "3PM"}
+        m["Stat"] = m["Market"].map(market_map)
+        m = m.dropna(subset=["Stat"]).copy()
+
+        tmp = props_out.copy()
+        tmp["Name_clean"] = tmp["Name"].astype(str).apply(clean_name)
+
+        merged = tmp.merge(
+            m[["Name_clean", "Stat", "Line"]],
+            on=["Name_clean", "Stat"],
+            how="left"
+        )
+
+        def prob_over(mu, sigma, line):
+            if not np.isfinite(line):
+                return np.nan
+            z = (float(mu) - float(line)) / max(1e-9, float(sigma))
+            return float(norm_cdf(z))
+
+        merged["Line"] = pd.to_numeric(merged["Line"], errors="coerce")
+        merged["P(Over)"] = merged.apply(lambda rr: prob_over(rr["Mean"], rr["Sigma"], rr["Line"]), axis=1)
+        merged["P(Under)"] = 1.0 - merged["P(Over)"]
+        merged["P(Over)"] = merged["P(Over)"].round(3)
+        merged["P(Under)"] = merged["P(Under)"].round(3)
+
+        props_out = merged.drop(columns=["Name_clean"], errors="ignore")
+
+    # Sort: by stat then mean desc
+    sort_stat = {"PTS": 0, "3PM": 1, "REB": 2, "AST": 3}
+    props_out["_stat_rank"] = props_out["Stat"].map(sort_stat).fillna(99)
+    props_out = props_out.sort_values(["_stat_rank", "Mean"], ascending=[True, False]).drop(columns=["_stat_rank"])
+
+    st.success("Props table ready.")
+    st.dataframe(props_out, use_container_width=True)
