@@ -1,7 +1,9 @@
 # ==========================
 # DraftKings NBA Optimizer — Stable + Fast + DvP (Manual CSV) + Late Swap Locks
 # + Player EXCLUDE (optimizer-only)
+# + Team Started (late swap: exclude from NEW selections)
 # + Team Exclude (optimizer-only; does NOT lock players)
+# + Vegas (manual CSV: Team/Opponent/Spread/Total) applied in Step B
 # + Props module (Top 15 projected by PTS/REB/AST/FG3M) with 70/80/90% bands + optional P(Over/Under)
 # ==========================
 
@@ -36,11 +38,11 @@ LEAGUE_TIMEOUT = 20
 GAMELOG_TIMEOUT = 12
 GAMELOG_RETRIES = 2
 
-# Minutes caps (semi-realistic + your hard cap)
+# Minutes caps
 STARTER_MIN_CUTOFF = 28.0
 STARTER_CAP = 36.0
 BENCH_CAP = 32.0
-MAX_MINUTES_ABS = 34.0  # HARD CAP
+MAX_MINUTES_ABS = 34.0  # HARD CAP YOU REQUESTED
 BENCH_FLOOR = 6.0
 
 # Recency blend weights
@@ -59,8 +61,14 @@ BUMP_CAPS = {
     "REB": 0.12,   # +12%
 }
 
+# Vegas adjustment (conservative)
+VEGAS_TOTAL_BASELINE = 225.0
+VEGAS_PACE_CAP = 0.05     # max ±5%
+VEGAS_SPREAD_T1 = 8.0     # moderate blowout risk
+VEGAS_SPREAD_T2 = 12.0    # high blowout risk
+
 # --- Props config ---
-PROPS_TOPK_PER_STAT = 15  # you requested top 15 per stat
+PROPS_TOPK_PER_STAT = 15
 VOL_LAST_N = 15
 VOL_TIMEOUT = 12
 VOL_RETRIES = 2
@@ -68,13 +76,14 @@ VOL_RETRIES = 2
 # Gist files
 GIST_SLATE = "slate.csv"
 GIST_DVP = "dvp.csv"
+GIST_VEGAS = "vegas.csv"
 GIST_OUT = "out.json"
 GIST_LOCKS = "locks.json"
 GIST_EXCLUDE = "exclude.json"
 GIST_BASE = "base.csv"
 GIST_FINAL = "final.csv"
 
-# Team abbreviation normalization (Hashtag vs DK vs NBA)
+# Team abbreviation normalization
 TEAM_ALIASES = {
     "NY": "NYK",
     "SA": "SAS",
@@ -183,7 +192,6 @@ def dk_fp(r):
         fp += 3.0
     return round(fp, 2)
 
-# DK "Game Info": "LAL@BOS 07:30PM ET"
 def parse_opponent_from_gameinfo(team_abbrev: str, game_info: str):
     if not isinstance(game_info, str):
         return None
@@ -223,7 +231,6 @@ def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + erf(x / sqrt(2.0)))
 
 def z_for_two_sided(conf: float) -> float:
-    # two-sided z (approx)
     if conf >= 0.90: return 1.645
     if conf >= 0.80: return 1.282
     return 1.036
@@ -298,9 +305,6 @@ def league_player_df():
     return df
 
 def match_player_to_nba(slate_name, dk_team, nba_df):
-    """
-    Stricter matching to avoid wrong-brother / same-last-name issues.
-    """
     cn = clean_name(slate_name)
     sn = strip_suffix(slate_name)
     dk_team = norm_team(dk_team)
@@ -310,21 +314,16 @@ def match_player_to_nba(slate_name, dk_team, nba_df):
             return dfsub
         return dfsub[dfsub["NBA_Team"] == dk_team]
 
-    # 1) Exact clean
     sub = nba_df[nba_df["NBA_Name_clean"] == cn].copy()
     sub = team_ok(sub)
-    if len(sub) == 1:
-        return sub.iloc[0]
-    if len(sub) > 1:
+    if len(sub) >= 1:
         return sub.iloc[0]
 
-    # 2) Exact stripped
     sub = nba_df[nba_df["NBA_Name_stripped"] == sn].copy()
     sub = team_ok(sub)
     if len(sub) == 1:
         return sub.iloc[0]
 
-    # 3) Last + first similarity gate
     parts = sn.split()
     if len(parts) >= 2:
         first = parts[0]
@@ -376,10 +375,6 @@ def gamelog_recent(pid: int, last_n: int):
 
 @st.cache_data(ttl=900)
 def gamelog_volatility(pid: int, last_n: int):
-    """
-    Returns std dev for PTS/REB/AST/FG3M from last_n games,
-    plus mean minutes from those games (for minutes-adjustment).
-    """
     last_err = None
     for attempt in range(1, VOL_RETRIES + 1):
         try:
@@ -417,7 +412,7 @@ def gamelog_volatility(pid: int, last_n: int):
 # ==========================
 st.sidebar.subheader("Reliability")
 deterministic_mode = st.sidebar.checkbox("Deterministic mode (freeze BASE)", value=True)
-st.sidebar.caption("When ON: Step B uses saved BASE only. Projections won't change unless you rebuild BASE or change OUT/locks/DvP.")
+st.sidebar.caption("When ON: Step B uses saved BASE only. Projections won't change unless you rebuild BASE or change OUT/locks/DvP/Vegas.")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Recency Settings")
@@ -447,6 +442,15 @@ else:
     if not dvp_text:
         st.warning("Upload Hashtag DvP CSV to apply opponent adjustments (app still works without it).")
         dvp_text = None
+
+upload_vegas = st.sidebar.file_uploader("Upload Vegas CSV (Team,Opponent,Spread,Total) — optional", type="csv")
+if upload_vegas:
+    vegas_text = upload_vegas.getvalue().decode("utf-8", errors="ignore")
+    gist_write({GIST_VEGAS: vegas_text})
+else:
+    vegas_text = gist_read(GIST_VEGAS)
+    if not vegas_text:
+        vegas_text = None
 
 
 # ==========================
@@ -498,8 +502,8 @@ try:
 except Exception:
     saved_exclude = {}
 
-saved_locked_teams = set(saved_locks.get("locked_teams", []))          # Teams started / late swap
-saved_locked_players = set(saved_locks.get("locked_players", []))      # Player locks
+saved_locked_teams = set(saved_locks.get("locked_teams", []))
+saved_locked_players = set(saved_locks.get("locked_players", []))
 
 
 # ==========================
@@ -512,6 +516,7 @@ sig = {
     "out": md5_text(json.dumps(saved_out, sort_keys=True)) if saved_out else "none",
     "exclude": md5_text(json.dumps(saved_exclude, sort_keys=True)) if saved_exclude else "none",
     "dvp": md5_text(dvp_text) if dvp_text else "none",
+    "vegas": md5_text(vegas_text) if vegas_text else "none",
     "recency": f"use={use_recency},topN={top_n},lastN={last_n_games}",
     "caps": f"starter={STARTER_CAP},bench={BENCH_CAP},abs={MAX_MINUTES_ABS}",
 }
@@ -524,30 +529,22 @@ with st.expander("Run Signature (helps explain why projections changed)", expand
 # ==========================
 st.subheader("Late Swap Controls")
 
-# "Teams started" = exclude from NEW optimizer selections (late swap control)
 locked_teams = st.multiselect(
     "Teams started (exclude from NEW optimizer selections)",
     teams_on_slate,
     default=[t for t in teams_on_slate if t in saved_locked_teams]
 )
 
-# Team exclude = remove from optimizer pool (does NOT lock players)
 exclude_teams = st.multiselect(
     "Exclude teams from optimizer pool (do NOT lock them)",
     teams_on_slate,
     default=[]
 )
 
-# Player-level flags
 slate["OUT"] = slate["Name_clean"].map(lambda x: bool(saved_out.get(x, False)))
-
-# LOCK is player-level only (no team auto-lock)
 slate["LOCK"] = slate["Name_clean"].map(lambda x: bool(x in saved_locked_players))
-
-# Optimizer-only exclude (player-level)
 slate["EXCLUDE"] = slate["Name_clean"].map(lambda x: bool(saved_exclude.get(x, False)))
 
-# Salary moved directly after Name
 edited = st.data_editor(
     slate[["OUT", "LOCK", "EXCLUDE", "Name", "Salary", "Team", "Opp", "PrimaryPos", "Positions"]],
     column_config={
@@ -633,6 +630,45 @@ if dvp_text:
 
 
 # ==========================
+# LOAD VEGAS (manual CSV)
+# ==========================
+def load_vegas(text: str):
+    if not text:
+        return None, None
+    try:
+        v = pd.read_csv(StringIO(text))
+    except Exception:
+        return None, "Vegas CSV could not be read."
+
+    v.columns = [str(c).strip() for c in v.columns]
+    req = ["Team", "Opponent", "Spread", "Total"]
+    missing = [c for c in req if c not in v.columns]
+    if missing:
+        return None, f"Vegas CSV missing columns: {missing}"
+
+    out = pd.DataFrame()
+    out["TEAM"] = v["Team"].astype(str).apply(norm_team)
+    out["OPP"] = v["Opponent"].astype(str).apply(norm_team)
+    out["SPREAD"] = pd.to_numeric(v["Spread"], errors="coerce")
+    out["TOTAL"] = pd.to_numeric(v["Total"], errors="coerce")
+
+    out = out.dropna(subset=["TEAM", "OPP", "SPREAD", "TOTAL"]).copy()
+    out = out[(out["TEAM"] != "") & (out["OPP"] != "")].copy()
+
+    # map by TEAM
+    key = {rr["TEAM"]: {"OPP": rr["OPP"], "SPREAD": float(rr["SPREAD"]), "TOTAL": float(rr["TOTAL"])} for _, rr in out.iterrows()}
+    return key, None
+
+vegas_map = None
+if vegas_text:
+    vegas_map, vegas_err = load_vegas(vegas_text)
+    if vegas_err:
+        st.warning(vegas_err)
+    else:
+        st.sidebar.success("Vegas loaded ✓")
+
+
+# ==========================
 # STEP A — BUILD BASE
 # ==========================
 st.divider()
@@ -658,7 +694,7 @@ if st.button("Build BASE", disabled=(deterministic_mode and not confirm_rebuild)
 
         hit = match_player_to_nba(r["Name"], r["Team"], nba_df)
         if hit is None:
-            row = {
+            rows.append({
                 **r.to_dict(),
                 "Minutes": np.nan,
                 **{c: np.nan for c in STAT_COLS},
@@ -666,8 +702,7 @@ if st.button("Build BASE", disabled=(deterministic_mode and not confirm_rebuild)
                 "Notes": "No safe match in league stats",
                 "Matched_NBA_Name": "",
                 "Matched_NBA_Team": "",
-            }
-            rows.append(row)
+            })
             continue
 
         season_min = float(hit["MIN"])
@@ -717,10 +752,10 @@ if st.button("Build BASE", disabled=(deterministic_mode and not confirm_rebuild)
 
 
 # ==========================
-# STEP B — RUN PROJECTIONS (Injury minutes + opportunity + DvP)
+# STEP B — RUN PROJECTIONS (Injury minutes + opportunity + Vegas + DvP)
 # ==========================
 st.divider()
-st.subheader("Step B — Run Projections (Injury Bumps + DvP)")
+st.subheader("Step B — Run Projections (Injury Bumps + Vegas + DvP)")
 
 if st.button("Run Projections"):
     base_text = gist_read(GIST_BASE)
@@ -737,9 +772,10 @@ if st.button("Run Projections"):
     base["Notes"] = base.get("Notes", "").fillna("").astype(str)
 
     base["BumpNotes"] = ""
+    base["UsageNotes"] = ""
+    base["VegasNotes"] = ""
     base["DvPNotes"] = ""
     base["DvPMult"] = 1.0
-    base["UsageNotes"] = ""
 
     # Apply OUT flags
     base.loc[base["Name_clean"].isin(out_set), "Status"] = "OUT"
@@ -765,7 +801,7 @@ if st.button("Run Projections"):
 
     base["MIN_CAP"] = base.apply(minute_cap, axis=1)
 
-    # 1) Minutes redistribution
+    # 1) Minutes redistribution from OUT
     for team in base["Team"].dropna().unique():
         out_t = base[(base["Team"] == team) & (base["Status"] == "OUT")]
         ok_t = base[(base["Team"] == team) & (base["Status"] == "OK")]
@@ -793,6 +829,33 @@ if st.button("Run Projections"):
             base.loc[idx, "Minutes"] = round(new_m, 2)
             if inc > 0:
                 base.loc[idx, "BumpNotes"] = (base.loc[idx, "BumpNotes"] + f" MIN+{inc:.1f}").strip()
+
+    # 1b) Vegas spread -> small minutes risk adjustment (AFTER injuries, BEFORE stat recompute)
+    if vegas_map is not None:
+        for idx, r in base[base["Status"] == "OK"].iterrows():
+            team = norm_team(r.get("Team", ""))
+            if not team or team not in vegas_map:
+                continue
+            spread = float(vegas_map[team]["SPREAD"])
+            abs_sp = abs(spread)
+
+            bm = float(r.get("BASE_Minutes", 0.0)) if pd.notna(r.get("BASE_Minutes", np.nan)) else 0.0
+            is_starter = bm >= STARTER_MIN_CUTOFF
+
+            if abs_sp >= VEGAS_SPREAD_T2:
+                mult = 0.95 if is_starter else 1.02
+                tag = "SPREAD12"
+            elif abs_sp >= VEGAS_SPREAD_T1:
+                mult = 0.97 if is_starter else 1.01
+                tag = "SPREAD8"
+            else:
+                continue
+
+            new_m = float(r["Minutes"]) * mult
+            # enforce cap
+            new_m = min(new_m, float(r["MIN_CAP"]))
+            base.loc[idx, "Minutes"] = round(new_m, 2)
+            base.loc[idx, "VegasNotes"] = (base.loc[idx, "VegasNotes"] + f" {tag}x{mult:.2f}").strip()
 
     # Recompute stats from per-minute using updated minutes
     for idx in base.index[base["Status"] == "OK"]:
@@ -865,6 +928,22 @@ if st.button("Run Projections"):
 
     base["UsageNotes"] = base["UsageNotes"].fillna("").astype(str).str.strip()
 
+    # 2b) Vegas TOTAL -> pace multiplier (after injury + opportunity, before DvP)
+    if vegas_map is not None:
+        for idx, r in base[base["Status"] == "OK"].iterrows():
+            team = norm_team(r.get("Team", ""))
+            if not team or team not in vegas_map:
+                continue
+            total = float(vegas_map[team]["TOTAL"])
+            raw = total / VEGAS_TOTAL_BASELINE
+            pace_mult = clamp(raw, 1.0 - VEGAS_PACE_CAP, 1.0 + VEGAS_PACE_CAP)
+
+            # apply only to the "pace" stats
+            for c in ["PTS", "AST", "FG3M"]:
+                base.loc[idx, c] = round(float(base.loc[idx, c]) * pace_mult, 2)
+
+            base.loc[idx, "VegasNotes"] = (base.loc[idx, "VegasNotes"] + f" TOTAL{total:.1f}x{pace_mult:.3f}").strip()
+
     # 3) Apply DvP vs opponent by position
     if dvp_pack is not None:
         dvp_df, league_avg = dvp_pack
@@ -911,9 +990,11 @@ if st.button("Run Projections"):
     st.success("Saved FINAL")
 
     show_cols = [
-        "Name", "Salary", "Team", "Opp", "PrimaryPos", "Minutes", "MIN_CAP",
-        "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV", "DK_FP",
-        "Notes", "BumpNotes", "UsageNotes", "DvPNotes"
+        "Name", "Salary", "Team", "Opp", "PrimaryPos",
+        "Minutes", "MIN_CAP",
+        "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV",
+        "DK_FP",
+        "Notes", "BumpNotes", "UsageNotes", "VegasNotes", "DvPNotes"
     ]
     st.dataframe(final[show_cols], use_container_width=True)
 
@@ -971,24 +1052,23 @@ def assign_locked_to_slots(locked_df):
 if st.button("Optimize (respect locks)"):
     locked_df = pool[pool["Name_clean"].isin(locked_players_set)].copy()
 
-    # Exclude players from optimizer pool (but never exclude players you LOCKED)
     excluded_effective = set(excluded_players_set) - set(locked_players_set)
 
     candidate_df = pool.copy()
 
-    # 1) Exclude TEAMS from optimizer pool (does NOT lock them)
+    # Exclude teams from pool (does NOT lock)
     if excluded_teams_set:
         candidate_df = candidate_df[~candidate_df["Team"].isin(excluded_teams_set)].copy()
 
-    # 2) Exclude PLAYERs from optimizer pool
+    # Exclude players from pool
     if excluded_effective:
         candidate_df = candidate_df[~candidate_df["Name_clean"].isin(excluded_effective)].copy()
 
-    # 3) Late swap: exclude started teams from NEW selections
+    # Late swap: exclude started teams from NEW selections
     if started_teams:
         candidate_df = candidate_df[~candidate_df["Team"].isin(started_teams)].copy()
 
-    # Always re-add locked players so they remain eligible even if team was excluded/started
+    # Always re-add locked players (even if team excluded/started)
     if not locked_df.empty:
         candidate_df = pd.concat([candidate_df, locked_df], axis=0).drop_duplicates(subset=["Name_clean"])
 
@@ -1023,7 +1103,6 @@ if st.button("Optimize (respect locks)"):
         st.metric("Total DK FP", round(float(lineup_df["DK_FP"].sum()), 2))
         st.stop()
 
-    # Optimize over non-locked players
     opt_pool = candidate_df[~candidate_df["Name_clean"].isin(locked_players_set)].copy()
 
     prob = LpProblem("DK_LATE_SWAP", LpMaximize)
@@ -1091,7 +1170,6 @@ if st.button("Optimize (respect locks)"):
 st.divider()
 st.subheader("Props (Top 15 by Stat) — 70/80/90% confidence + optional P(Over/Under)")
 
-# Pull FINAL
 final_text = gist_read(GIST_FINAL)
 if not final_text:
     st.info("Run Step B first to create FINAL projections.")
@@ -1104,7 +1182,6 @@ for c in ["Minutes", "PTS", "REB", "AST", "FG3M", "Salary"]:
     if c in final_df.columns:
         final_df[c] = pd.to_numeric(final_df[c], errors="coerce")
 
-# Top 15 per stat based on projections
 stat_list = ["PTS", "REB", "AST", "FG3M"]
 top_sets = []
 for stat in stat_list:
@@ -1119,7 +1196,6 @@ st.caption(
     f"(PTS/REB/AST/3PM). Total players: {len(props_pool)}"
 )
 
-# Optional upload of prop lines
 props_file = st.file_uploader(
     "Upload Props CSV (optional) with columns: Name, Market (PTS/REB/AST/3PM), Line",
     type="csv",
@@ -1166,10 +1242,8 @@ if st.button("Build Prop Table"):
         if proj_min <= 0:
             continue
 
-        # minutes-adjust std: sigma * sqrt(proj_min / hist_mean_min)
         scale = sqrt(max(0.25, proj_min / max(1.0, mean_min_hist)))
 
-        # Build rows for each stat using FINAL means
         row_base = final_df[final_df["Name_clean"] == r["Name_clean"]].head(1)
         if row_base.empty:
             continue
@@ -1181,7 +1255,7 @@ if st.button("Build Prop Table"):
                 continue
 
             sigma = float(stds_raw.get(stat, 0.0)) * float(scale)
-            sigma = max(0.5, sigma)  # floor keeps intervals reasonable
+            sigma = max(0.5, sigma)
 
             row = {
                 "Name": row_base["Name"],
@@ -1206,10 +1280,8 @@ if st.button("Build Prop Table"):
         st.warning("No prop rows generated (name matching/volatility may have failed).")
         st.stop()
 
-    # If props lines uploaded, compute probabilities vs line
     if (props_lines is not None) and use_lines:
         m = props_lines.dropna(subset=["Line"]).copy()
-
         market_map = {"PTS": "PTS", "REB": "REB", "AST": "AST", "3PM": "3PM", "FG3M": "3PM"}
         m["Stat"] = m["Market"].map(market_map)
         m = m.dropna(subset=["Stat"]).copy()
@@ -1237,7 +1309,6 @@ if st.button("Build Prop Table"):
 
         props_out = merged.drop(columns=["Name_clean"], errors="ignore")
 
-    # Sort: by stat then mean desc
     sort_stat = {"PTS": 0, "3PM": 1, "REB": 2, "AST": 3}
     props_out["_stat_rank"] = props_out["Stat"].map(sort_stat).fillna(99)
     props_out = props_out.sort_values(["_stat_rank", "Mean"], ascending=[True, False]).drop(columns=["_stat_rank"])
