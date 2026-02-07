@@ -4,6 +4,7 @@
 # + Team Started (late swap: exclude from NEW selections)
 # + Team Exclude (optimizer-only; does NOT lock players)
 # + Vegas (manual CSV: Team/Opponent/Spread/Total) applied in Step B
+# + MOBILE VEGAS: Paste CSV/TSV in-app (no downloads)
 # + Props module (Top 15 projected by PTS/REB/AST/FG3M) with 70/80/90% bands + optional P(Over/Under)
 # ==========================
 
@@ -42,7 +43,7 @@ GAMELOG_RETRIES = 2
 STARTER_MIN_CUTOFF = 28.0
 STARTER_CAP = 36.0
 BENCH_CAP = 32.0
-MAX_MINUTES_ABS = 34.0  # HARD CAP YOU REQUESTED
+MAX_MINUTES_ABS = 34.0  # HARD CAP
 BENCH_FLOOR = 6.0
 
 # Recency blend weights
@@ -443,8 +444,33 @@ else:
         st.warning("Upload Hashtag DvP CSV to apply opponent adjustments (app still works without it).")
         dvp_text = None
 
-upload_vegas = st.sidebar.file_uploader("Upload Vegas CSV (Team,Opponent,Spread,Total) — optional", type="csv")
-if upload_vegas:
+# --- VEGAS (MOBILE FRIENDLY) ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("Vegas (mobile-friendly)")
+
+vegas_paste = st.sidebar.text_area(
+    "Paste Vegas table (CSV or copied cells). Required columns: Team,Opponent,Spread,Total",
+    value="",
+    height=140,
+    placeholder="Team,Opponent,Spread,Total\nBOS,LAL,-6.5,232.5\nLAL,BOS,6.5,232.5"
+)
+
+upload_vegas = st.sidebar.file_uploader("...or upload vegas.csv", type="csv")
+
+vegas_text = None
+if vegas_paste.strip():
+    txt = vegas_paste.strip()
+
+    # If pasted from Sheets/Excel as tab-separated, convert tabs to commas
+    # (only if header doesn't already look comma-separated)
+    header = txt.splitlines()[0]
+    if "\t" in header and "," not in header:
+        txt = txt.replace("\t", ",")
+
+    vegas_text = txt
+    gist_write({GIST_VEGAS: vegas_text})
+
+elif upload_vegas:
     vegas_text = upload_vegas.getvalue().decode("utf-8", errors="ignore")
     gist_write({GIST_VEGAS: vegas_text})
 else:
@@ -638,13 +664,13 @@ def load_vegas(text: str):
     try:
         v = pd.read_csv(StringIO(text))
     except Exception:
-        return None, "Vegas CSV could not be read."
+        return None, "Vegas data could not be read. Make sure it has a header row."
 
     v.columns = [str(c).strip() for c in v.columns]
     req = ["Team", "Opponent", "Spread", "Total"]
     missing = [c for c in req if c not in v.columns]
     if missing:
-        return None, f"Vegas CSV missing columns: {missing}"
+        return None, f"Vegas data missing columns: {missing}"
 
     out = pd.DataFrame()
     out["TEAM"] = v["Team"].astype(str).apply(norm_team)
@@ -852,7 +878,6 @@ if st.button("Run Projections"):
                 continue
 
             new_m = float(r["Minutes"]) * mult
-            # enforce cap
             new_m = min(new_m, float(r["MIN_CAP"]))
             base.loc[idx, "Minutes"] = round(new_m, 2)
             base.loc[idx, "VegasNotes"] = (base.loc[idx, "VegasNotes"] + f" {tag}x{mult:.2f}").strip()
@@ -938,7 +963,6 @@ if st.button("Run Projections"):
             raw = total / VEGAS_TOTAL_BASELINE
             pace_mult = clamp(raw, 1.0 - VEGAS_PACE_CAP, 1.0 + VEGAS_PACE_CAP)
 
-            # apply only to the "pace" stats
             for c in ["PTS", "AST", "FG3M"]:
                 base.loc[idx, c] = round(float(base.loc[idx, c]) * pace_mult, 2)
 
