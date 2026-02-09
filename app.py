@@ -5,7 +5,7 @@
 # + Team Exclude (optimizer-only; does NOT lock players)
 # + Vegas (manual CSV: Team/Opponent/Spread/Total) applied in Step B
 # + MOBILE VEGAS: Paste CSV/TSV in-app (no downloads)
-# + Props module (Top 15 projected by PTS/REB/AST/FG3M) with 70/80/90% bands + optional P(Over/Under)
+# + Prop CHECKER (single player) with CACHE + ONLY P(Over)
 # ==========================
 
 import json
@@ -68,9 +68,8 @@ VEGAS_PACE_CAP = 0.05     # max ±5%
 VEGAS_SPREAD_T1 = 8.0     # moderate blowout risk
 VEGAS_SPREAD_T2 = 12.0    # high blowout risk
 
-# --- Props config ---
-PROPS_TOPK_PER_STAT = 15
-VOL_LAST_N = 15
+# Volatility defaults (prop checker)
+VOL_LAST_N_DEFAULT = 15
 VOL_TIMEOUT = 12
 VOL_RETRIES = 2
 
@@ -376,6 +375,10 @@ def gamelog_recent(pid: int, last_n: int):
 
 @st.cache_data(ttl=900)
 def gamelog_volatility(pid: int, last_n: int):
+    """
+    Cached at the Streamlit app layer. This makes repeated prop checks for the same
+    player fast (no re-pulling game logs).
+    """
     last_err = None
     for attempt in range(1, VOL_RETRIES + 1):
         try:
@@ -460,16 +463,11 @@ upload_vegas = st.sidebar.file_uploader("...or upload vegas.csv", type="csv")
 vegas_text = None
 if vegas_paste.strip():
     txt = vegas_paste.strip()
-
-    # If pasted from Sheets/Excel as tab-separated, convert tabs to commas
-    # (only if header doesn't already look comma-separated)
     header = txt.splitlines()[0]
     if "\t" in header and "," not in header:
         txt = txt.replace("\t", ",")
-
     vegas_text = txt
     gist_write({GIST_VEGAS: vegas_text})
-
 elif upload_vegas:
     vegas_text = upload_vegas.getvalue().decode("utf-8", errors="ignore")
     gist_write({GIST_VEGAS: vegas_text})
@@ -681,7 +679,6 @@ def load_vegas(text: str):
     out = out.dropna(subset=["TEAM", "OPP", "SPREAD", "TOTAL"]).copy()
     out = out[(out["TEAM"] != "") & (out["OPP"] != "")].copy()
 
-    # map by TEAM
     key = {rr["TEAM"]: {"OPP": rr["OPP"], "SPREAD": float(rr["SPREAD"]), "TOTAL": float(rr["TOTAL"])} for _, rr in out.iterrows()}
     return key, None
 
@@ -803,14 +800,11 @@ if st.button("Run Projections"):
     base["DvPNotes"] = ""
     base["DvPMult"] = 1.0
 
-    # Apply OUT flags
     base.loc[base["Name_clean"].isin(out_set), "Status"] = "OUT"
 
-    # Numeric
     for c in STAT_COLS:
         base[c] = pd.to_numeric(base[c], errors="coerce")
 
-    # Per-minute rates from BASE
     for c in STAT_COLS:
         base[f"PM_{c}"] = np.where(
             (base["Status"] == "OK") & (base["Minutes"].fillna(0) > 0),
@@ -819,7 +813,6 @@ if st.button("Run Projections"):
         )
         base[f"PM_{c}"] = base[f"PM_{c}"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    # Role-based cap + absolute cap
     def minute_cap(row):
         bm = float(row["BASE_Minutes"]) if pd.notna(row["BASE_Minutes"]) else 0.0
         cap_role = STARTER_CAP if bm >= STARTER_MIN_CUTOFF else BENCH_CAP
@@ -856,7 +849,7 @@ if st.button("Run Projections"):
             if inc > 0:
                 base.loc[idx, "BumpNotes"] = (base.loc[idx, "BumpNotes"] + f" MIN+{inc:.1f}").strip()
 
-    # 1b) Vegas spread -> small minutes risk adjustment (AFTER injuries, BEFORE stat recompute)
+    # 1b) Vegas spread -> small minutes risk adjustment
     if vegas_map is not None:
         for idx, r in base[base["Status"] == "OK"].iterrows():
             team = norm_team(r.get("Team", ""))
@@ -953,7 +946,7 @@ if st.button("Run Projections"):
 
     base["UsageNotes"] = base["UsageNotes"].fillna("").astype(str).str.strip()
 
-    # 2b) Vegas TOTAL -> pace multiplier (after injury + opportunity, before DvP)
+    # 2b) Vegas TOTAL -> pace multiplier
     if vegas_map is not None:
         for idx, r in base[base["Status"] == "OK"].iterrows():
             team = norm_team(r.get("Team", ""))
@@ -1004,10 +997,8 @@ if st.button("Run Projections"):
                 f"PTS{mults['PTS']:.2f} REB{mults['REB']:.2f} AST{mults['AST']:.2f}"
             )
 
-    # DK FP
     base.loc[base["Status"] == "OK", "DK_FP"] = base[base["Status"] == "OK"].apply(dk_fp, axis=1)
 
-    # FINAL = OK and not OUT
     final = base[(base["Status"] == "OK") & (~base["Name_clean"].isin(out_set))].copy()
 
     gist_write({GIST_FINAL: final.to_csv(index=False)})
@@ -1189,10 +1180,10 @@ if st.button("Optimize (respect locks)"):
 
 
 # ==========================
-# PROPS MODULE (Top 15 projected by PTS/REB/AST/FG3M)
+# PROP CHECKER (single player) — CACHED + ONLY P(Over)
 # ==========================
 st.divider()
-st.subheader("Props (Top 15 by Stat) — 70/80/90% confidence + optional P(Over/Under)")
+st.subheader("Prop Checker — 70/80/90% + P(Over)")
 
 final_text = gist_read(GIST_FINAL)
 if not final_text:
@@ -1206,136 +1197,122 @@ for c in ["Minutes", "PTS", "REB", "AST", "FG3M", "Salary"]:
     if c in final_df.columns:
         final_df[c] = pd.to_numeric(final_df[c], errors="coerce")
 
-stat_list = ["PTS", "REB", "AST", "FG3M"]
-top_sets = []
-for stat in stat_list:
-    topk = final_df.dropna(subset=[stat]).sort_values(stat, ascending=False).head(PROPS_TOPK_PER_STAT)
-    top_sets.append(topk[["Name", "Name_clean", "Team", "Minutes", stat]].copy())
+# ---- session_state cache for prop evaluations (extra fast) ----
+# This is in addition to @st.cache_data on gamelog_volatility.
+# It avoids recomputing derived sigma scaling when you re-check the same combo.
+if "prop_eval_cache" not in st.session_state:
+    st.session_state.prop_eval_cache = {}  # key -> dict
 
-props_pool = pd.concat(top_sets, axis=0).drop_duplicates(subset=["Name_clean"]).copy()
-props_pool = props_pool.dropna(subset=["Minutes"]).copy()
+player_options = final_df.dropna(subset=["Salary"]).sort_values("Salary", ascending=False)["Name"].astype(str).tolist()
+if not player_options:
+    st.info("No players found in FINAL.")
+    st.stop()
 
-st.caption(
-    f"Volatility computed for union of top {PROPS_TOPK_PER_STAT} projected players in each stat "
-    f"(PTS/REB/AST/3PM). Total players: {len(props_pool)}"
-)
+sel_player = st.selectbox("Player", player_options, index=0)
 
-props_file = st.file_uploader(
-    "Upload Props CSV (optional) with columns: Name, Market (PTS/REB/AST/3PM), Line",
-    type="csv",
-    key="props_upload"
-)
+prop_map = {
+    "Points (PTS)": "PTS",
+    "Rebounds (REB)": "REB",
+    "Assists (AST)": "AST",
+    "3-Pointers Made (3PM)": "FG3M",
+}
+sel_prop_label = st.selectbox("Prop", list(prop_map.keys()), index=0)
+sel_stat = prop_map[sel_prop_label]
 
-props_lines = None
-if props_file:
-    props_lines = pd.read_csv(props_file)
-    props_lines.columns = [str(c).strip() for c in props_lines.columns]
-    needed = {"Name", "Market", "Line"}
-    if not needed.issubset(set(props_lines.columns)):
-        st.error(f"Props CSV missing columns. Need: {sorted(list(needed))}")
-        props_lines = None
-    else:
-        props_lines["Name_clean"] = props_lines["Name"].astype(str).apply(clean_name)
-        props_lines["Market"] = props_lines["Market"].astype(str).str.upper().str.strip()
-        props_lines["Line"] = pd.to_numeric(props_lines["Line"], errors="coerce")
+line = st.number_input("Sportsbook line", min_value=0.0, value=0.0, step=0.5)
 
 conf_levels = st.multiselect("Confidence levels", [0.70, 0.80, 0.90], default=[0.70, 0.80, 0.90])
-use_lines = st.checkbox("If props CSV uploaded, compute P(Over/Under) vs the line", value=True)
 
-if st.button("Build Prop Table"):
+c1, c2 = st.columns(2)
+with c1:
+    vol_last_n = st.slider("Volatility sample (last N games)", 5, 25, VOL_LAST_N_DEFAULT, 1)
+with c2:
+    show_debug = st.checkbox("Show debug details", value=False)
+
+if st.button("Evaluate Prop"):
     nba_df = league_player_df()
-    prog = st.progress(0, text="Computing volatility (recent game logs)...")
 
-    out_rows = []
-    props_pool_reset = props_pool.reset_index(drop=True)
+    row = final_df[final_df["Name"] == sel_player].head(1)
+    if row.empty:
+        st.error("Player not found in FINAL projections.")
+        st.stop()
+    row = row.iloc[0]
 
-    for i, r in props_pool_reset.iterrows():
-        prog.progress((i + 1) / len(props_pool_reset), text=f"Volatility: {r['Name']} ({i+1}/{len(props_pool_reset)})")
+    team = norm_team(row.get("Team", ""))
+    minutes_proj = float(row.get("Minutes", np.nan))
+    mu = float(row.get(sel_stat, np.nan))
 
-        hit = match_player_to_nba(r["Name"], r["Team"], nba_df)
-        if hit is None:
-            continue
-
-        pid = int(hit["PLAYER_ID"])
-        try:
-            stds_raw, mean_min_hist = gamelog_volatility(pid, VOL_LAST_N)
-        except Exception:
-            continue
-
-        proj_min = float(r["Minutes"]) if pd.notna(r["Minutes"]) else 0.0
-        if proj_min <= 0:
-            continue
-
-        scale = sqrt(max(0.25, proj_min / max(1.0, mean_min_hist)))
-
-        row_base = final_df[final_df["Name_clean"] == r["Name_clean"]].head(1)
-        if row_base.empty:
-            continue
-        row_base = row_base.iloc[0]
-
-        for stat in ["PTS", "REB", "AST", "FG3M"]:
-            mu = float(row_base.get(stat, np.nan))
-            if not np.isfinite(mu):
-                continue
-
-            sigma = float(stds_raw.get(stat, 0.0)) * float(scale)
-            sigma = max(0.5, sigma)
-
-            row = {
-                "Name": row_base["Name"],
-                "Team": row_base.get("Team", ""),
-                "Minutes": round(float(row_base.get("Minutes", proj_min)), 2),
-                "Stat": stat if stat != "FG3M" else "3PM",
-                "Mean": round(mu, 2),
-                "Sigma": round(sigma, 2),
-            }
-
-            for conf in conf_levels:
-                z = z_for_two_sided(float(conf))
-                lo = mu - z * sigma
-                hi = mu + z * sigma
-                row[f"{int(conf*100)}%_Low"] = round(lo, 2)
-                row[f"{int(conf*100)}%_High"] = round(hi, 2)
-
-            out_rows.append(row)
-
-    props_out = pd.DataFrame(out_rows)
-    if props_out.empty:
-        st.warning("No prop rows generated (name matching/volatility may have failed).")
+    if not np.isfinite(mu) or not np.isfinite(minutes_proj) or minutes_proj <= 0:
+        st.error("Missing projection or minutes for this player.")
         st.stop()
 
-    if (props_lines is not None) and use_lines:
-        m = props_lines.dropna(subset=["Line"]).copy()
-        market_map = {"PTS": "PTS", "REB": "REB", "AST": "AST", "3PM": "3PM", "FG3M": "3PM"}
-        m["Stat"] = m["Market"].map(market_map)
-        m = m.dropna(subset=["Stat"]).copy()
+    hit = match_player_to_nba(sel_player, team, nba_df)
+    if hit is None:
+        st.error("Could not safely match player to NBA stats (name/team mismatch).")
+        st.stop()
 
-        tmp = props_out.copy()
-        tmp["Name_clean"] = tmp["Name"].astype(str).apply(clean_name)
+    pid = int(hit["PLAYER_ID"])
 
-        merged = tmp.merge(
-            m[["Name_clean", "Stat", "Line"]],
-            on=["Name_clean", "Stat"],
-            how="left"
-        )
+    cache_key = f"{pid}|{sel_stat}|{int(vol_last_n)}|{round(minutes_proj,2)}"
+    cached = st.session_state.prop_eval_cache.get(cache_key)
 
-        def prob_over(mu, sigma, line):
-            if not np.isfinite(line):
-                return np.nan
-            z = (float(mu) - float(line)) / max(1e-9, float(sigma))
-            return float(norm_cdf(z))
+    if cached is None:
+        try:
+            stds_raw, mean_min_hist = gamelog_volatility(pid, int(vol_last_n))
+        except Exception as e:
+            st.error(f"Could not pull volatility from game logs: {str(e)[:140]}")
+            st.stop()
 
-        merged["Line"] = pd.to_numeric(merged["Line"], errors="coerce")
-        merged["P(Over)"] = merged.apply(lambda rr: prob_over(rr["Mean"], rr["Sigma"], rr["Line"]), axis=1)
-        merged["P(Under)"] = 1.0 - merged["P(Over)"]
-        merged["P(Over)"] = merged["P(Over)"].round(3)
-        merged["P(Under)"] = merged["P(Under)"].round(3)
+        sigma_raw = float(stds_raw.get(sel_stat, 0.0))
+        mean_min_hist = max(1.0, float(mean_min_hist))
+        scale = sqrt(max(0.25, minutes_proj / mean_min_hist))
+        sigma = max(0.5, sigma_raw * scale)
 
-        props_out = merged.drop(columns=["Name_clean"], errors="ignore")
+        cached = {
+            "stds_raw": stds_raw,
+            "mean_min_hist": mean_min_hist,
+            "sigma_raw": sigma_raw,
+            "scale": scale,
+            "sigma": sigma,
+            "nba_name": str(hit["NBA_Name"]),
+            "nba_team": str(hit["NBA_Team"]),
+        }
+        st.session_state.prop_eval_cache[cache_key] = cached
 
-    sort_stat = {"PTS": 0, "3PM": 1, "REB": 2, "AST": 3}
-    props_out["_stat_rank"] = props_out["Stat"].map(sort_stat).fillna(99)
-    props_out = props_out.sort_values(["_stat_rank", "Mean"], ascending=[True, False]).drop(columns=["_stat_rank"])
+    sigma = float(cached["sigma"])
 
-    st.success("Props table ready.")
-    st.dataframe(props_out, use_container_width=True)
+    st.markdown(f"### {sel_player} — {sel_prop_label}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Projected Mean", round(mu, 2))
+    c2.metric("Projected Minutes", round(minutes_proj, 2))
+    c3.metric("Volatility (σ)", round(sigma, 2))
+
+    # Confidence ranges
+    rows = []
+    for conf in conf_levels:
+        z = z_for_two_sided(float(conf))
+        lo = mu - z * sigma
+        hi = mu + z * sigma
+        rows.append({"Confidence": f"{int(conf*100)}%", "Low": round(lo, 2), "High": round(hi, 2)})
+
+    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    # ONLY P(Over)
+    if line > 0:
+        zline = (mu - float(line)) / max(1e-9, sigma)
+        p_over = float(norm_cdf(zline))
+        st.metric("P(Over)", round(p_over, 3))
+    else:
+        st.caption("Enter a sportsbook line (> 0) to compute P(Over).")
+
+    if show_debug:
+        st.code({
+            "cache_key": cache_key,
+            "NBA_match": cached.get("nba_name"),
+            "NBA_team": cached.get("nba_team"),
+            "pid": pid,
+            "hist_mean_min": round(float(cached.get("mean_min_hist", 0.0)), 2),
+            "sigma_raw_lastN": round(float(cached.get("sigma_raw", 0.0)), 3),
+            "scale": round(float(cached.get("scale", 0.0)), 3),
+            "sigma_final": round(float(cached.get("sigma", 0.0)), 3),
+        })
