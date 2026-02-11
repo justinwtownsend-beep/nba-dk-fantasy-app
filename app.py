@@ -1,6 +1,7 @@
 # ==========================
 # DraftKings NBA Optimizer
 # Fast + Recency + Manual Hashtag DvP (Book1.csv "Sort:" columns) + Late Swap Locks
+# + EXCLUDE players/teams from optimizer pool (does NOT lock them)
 # WITH TEAM ABBREVIATION NORMALIZATION (fixes NY/SA/etc.)
 # ==========================
 
@@ -33,7 +34,7 @@ LEAGUE_TIMEOUT = 20
 GAMELOG_TIMEOUT = 12
 GAMELOG_RETRIES = 2
 
-MAX_MINUTES = 34
+MAX_MINUTES = 34  # hard cap
 BENCH_FLOOR = 6
 
 # Recency blend weights
@@ -59,7 +60,6 @@ TEAM_ALIASES = {
     "GS": "GSW",
     "NO": "NOP",
     "PHO": "PHX",
-    # occasional variants
     "UTAH": "UTA",
     "WSH": "WAS",
 }
@@ -158,11 +158,10 @@ def norm_team(t: str) -> str:
     t = str(t).replace("\xa0", " ").strip().upper()
     if not t or t == "NAN":
         return ""
-    t = t.split()[0]  # handles "NY  1" style cells
+    t = t.split()[0]
     return TEAM_ALIASES.get(t, t)
 
 
-# DK "Game Info": "LAL@BOS 07:30PM ET"
 def parse_opponent_from_gameinfo(team_abbrev: str, game_info: str):
     if not isinstance(game_info, str):
         return None
@@ -184,14 +183,9 @@ def parse_opponent_from_gameinfo(team_abbrev: str, game_info: str):
 
 
 def _to_float_first_token(val):
-    """
-    Your DvP cells look like: "21.0   21" or "3.5  10"
-    Return first float found in the string.
-    """
     if pd.isna(val):
         return np.nan
-    s = str(val)
-    s = s.replace("\xa0", " ").strip()
+    s = str(val).replace("\xa0", " ").strip()
     m = re.search(r"[-+]?\d*\.?\d+", s)
     if not m:
         return np.nan
@@ -199,9 +193,6 @@ def _to_float_first_token(val):
 
 
 def _team_first_token(val):
-    """
-    Team cells look like: 'OKC   1' (team + rank).
-    """
     if pd.isna(val):
         return ""
     s = str(val).replace("\xa0", " ").strip().upper()
@@ -398,9 +389,9 @@ saved_locked_players = set(saved_locks.get("locked_players", []))
 
 
 # ==========================
-# TEAM LOCK UI
+# TOP TABLE (OUT / LOCK) + SAVE
 # ==========================
-st.subheader("Late Swap Controls")
+st.subheader("Late Swap Controls (OUT / LOCK)")
 
 locked_teams = st.multiselect(
     "Teams started / lock all players",
@@ -413,14 +404,15 @@ slate["LOCK"] = slate.apply(lambda r: True if r["Name_clean"] in saved_locked_pl
 slate["OUT"] = slate["Name_clean"].map(lambda x: bool(saved_out.get(x, False)))
 
 edited = st.data_editor(
-    slate[["OUT", "LOCK", "Name", "Team", "Opp", "PrimaryPos", "Salary", "Positions"]],
+    slate[["OUT", "LOCK", "Name", "Salary", "Team", "Opp", "PrimaryPos", "Positions"]],
     column_config={
         "OUT": st.column_config.CheckboxColumn("OUT"),
         "LOCK": st.column_config.CheckboxColumn("LOCK"),
     },
-    disabled=["Name", "Team", "Opp", "PrimaryPos", "Salary", "Positions"],
+    disabled=["Name", "Salary", "Team", "Opp", "PrimaryPos", "Positions"],
     use_container_width=True,
     hide_index=True,
+    height=420,
 )
 
 out_flags = {clean_name(r["Name"]): bool(r["OUT"]) for _, r in edited.iterrows()}
@@ -443,6 +435,19 @@ with c2:
     if st.button("Clear Locks"):
         gist_write({GIST_LOCKS: json.dumps({"locked_teams": [], "locked_players": []}, indent=2)})
         st.success("Cleared locks (refresh page)")
+
+
+# ==========================
+# EXCLUDE CONTROLS (optimizer only)
+# ==========================
+st.divider()
+st.subheader("Optimizer Excludes (does NOT lock)")
+
+exclude_teams = st.multiselect("Exclude Teams (remove from optimizer pool)", teams_on_slate, default=[])
+
+name_options = edited["Name"].astype(str).tolist()
+exclude_players = st.multiselect("Exclude Players (remove from optimizer pool)", name_options, default=[])
+exclude_players_set = set(clean_name(x) for x in exclude_players)
 
 
 # ==========================
@@ -544,7 +549,6 @@ if st.button("Build BASE"):
             except Exception as e:
                 notes = f"RECENCY_FAIL: {str(e)[:80]}"
 
-        # enforce max minutes at BASE as well (keeps things stable)
         mins = min(float(mins), MAX_MINUTES)
 
         row = {**r.to_dict(), "Minutes": round(float(mins), 2), **stats, "Status": "OK", "Notes": notes}
@@ -594,7 +598,7 @@ if st.button("Run Projections"):
         )
         base[f"PM_{c}"] = base[f"PM_{c}"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    # redistribute minutes by team (capped at MAX_MINUTES)
+    # redistribute minutes by team (capped)
     for team in base["Team"].dropna().unique():
         out_t = base[(base["Team"] == team) & (base["Status"] == "OUT")]
         ok_t = base[(base["Team"] == team) & (base["Status"] == "OK")]
@@ -665,229 +669,10 @@ if st.button("Run Projections"):
     gist_write({GIST_FINAL: final.to_csv(index=False)})
 
     st.success("Saved FINAL")
-    show_cols = ["Name", "Team", "Opp", "PrimaryPos", "Salary", "Minutes", "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV", "DK_FP", "Notes", "BumpNotes", "DvPNotes"]
+    show_cols = ["Name", "Salary", "Team", "Opp", "PrimaryPos", "Minutes",
+                 "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV", "DK_FP",
+                 "Notes", "BumpNotes", "DvPNotes"]
     st.dataframe(final[show_cols], use_container_width=True)
-
-
-# ==========================
-# PROPS (DraftKings via The Odds API) — P(Over) using our projections
-# ==========================
-st.divider()
-st.subheader("Props (DraftKings) — P(Over) from our projections")
-
-# NOTE: This pulls DraftKings player props via The Odds API "event-odds" endpoint.
-# Markets used: player_points, player_rebounds, player_assists, player_threes
-
-ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", None)
-
-def american_to_implied_prob(odds: float) -> float:
-    try:
-        o = float(odds)
-    except Exception:
-        return np.nan
-    if o == 0:
-        return np.nan
-    if o < 0:
-        return (-o) / ((-o) + 100.0)
-    return 100.0 / (o + 100.0)
-
-def normal_cdf(z: float) -> float:
-    # standard normal CDF via erf
-    return 0.5 * (1.0 + float(np.math.erf(z / np.sqrt(2.0))))
-
-def prob_over_normal(mu: float, sigma: float, line: float) -> float:
-    if sigma is None or pd.isna(sigma) or float(sigma) <= 1e-9:
-        return np.nan
-    z = (float(mu) - float(line)) / float(sigma)
-    return 1.0 - normal_cdf(z)
-
-@st.cache_data(ttl=300)
-def odds_events_nba(api_key: str):
-    url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
-    params = {"apiKey": api_key}
-    r = requests.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    return r.json()
-
-@st.cache_data(ttl=300)
-def odds_event_props(api_key: str, event_id: str, markets: str):
-    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
-    params = {
-        "regions": "us",
-        "markets": markets,
-        "bookmakers": "draftkings",
-        "oddsFormat": "american",
-        "apiKey": api_key,
-    }
-    r = requests.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    return r.json()
-
-@st.cache_data(ttl=900)
-def gamelog_volatility(pid: int, last_n: int):
-    """
-    Returns:
-      sample_mean_min, sd_pts, sd_reb, sd_ast, sd_fg3m
-    """
-    gl = playergamelog.PlayerGameLog(player_id=int(pid), season=SEASON, timeout=GAMELOG_TIMEOUT).get_data_frames()[0]
-    gl = gl.head(int(last_n)).copy()
-    if gl.empty:
-        raise RuntimeError("EMPTY_GAMELOG")
-    gl["MIN_f"] = gl["MIN"].apply(parse_minutes_min)
-    sample_mean_min = float(gl["MIN_f"].mean()) if float(gl["MIN_f"].mean()) > 0 else 1.0
-    # Per-game SDs
-    sd_pts = float(np.nanstd(gl["PTS"].astype(float), ddof=1)) if len(gl) > 1 else 0.0
-    sd_reb = float(np.nanstd(gl["REB"].astype(float), ddof=1)) if len(gl) > 1 else 0.0
-    sd_ast = float(np.nanstd(gl["AST"].astype(float), ddof=1)) if len(gl) > 1 else 0.0
-    sd_fg3m = float(np.nanstd(gl["FG3M"].astype(float), ddof=1)) if len(gl) > 1 else 0.0
-    return sample_mean_min, sd_pts, sd_reb, sd_ast, sd_fg3m
-
-def build_props_table(final_df: pd.DataFrame, api_key: str, top_players: int, vol_games: int):
-    if final_df is None or final_df.empty:
-        return pd.DataFrame()
-
-    # We'll only evaluate props for the top N DK_FP players (fast + useful).
-    top_df = final_df.sort_values("DK_FP", ascending=False).head(int(top_players)).copy()
-
-    # Map player name -> proj stats
-    top_df["Name_clean"] = top_df["Name"].apply(clean_name)
-    proj_map = {r["Name_clean"]: r for _, r in top_df.iterrows()}
-
-    events = odds_events_nba(api_key)
-    # Pull props for each event (DraftKings only). Cost depends on markets count. Keep it tight.
-    markets = "player_points,player_rebounds,player_assists,player_threes"
-
-    rows = []
-    prog = st.progress(0, text="Pulling DraftKings props via The Odds API...")
-    for i, ev in enumerate(events):
-        prog.progress((i + 1) / max(1, len(events)), text=f"Props: {ev.get('away_team','?')} @ {ev.get('home_team','?')} ({i+1}/{len(events)})")
-        try:
-            ev_odds = odds_event_props(api_key, ev["id"], markets=markets)
-        except Exception:
-            # Skip event on error
-            continue
-
-        for bk in ev_odds.get("bookmakers", []):
-            if bk.get("key") != "draftkings":
-                continue
-            for mkt in bk.get("markets", []):
-                key = mkt.get("key")
-                if key not in ["player_points", "player_rebounds", "player_assists", "player_threes"]:
-                    continue
-
-                for oc in mkt.get("outcomes", []):
-                    # Each outcome is Over/Under with description = player name
-                    side = oc.get("name")
-                    if side != "Over":
-                        continue  # user only wants P(over)
-                    player = oc.get("description", "")
-                    line = oc.get("point", None)
-                    price = oc.get("price", None)
-                    if player is None or line is None:
-                        continue
-
-                    pclean = clean_name(player)
-                    # Only include players we have projections for (top players)
-                    if pclean not in proj_map:
-                        continue
-
-                    pr = proj_map[pclean]
-                    # Choose projected stat
-                    if key == "player_points":
-                        mu = float(pr.get("PTS", np.nan))
-                        stat_label = "PTS"
-                        min_sigma_floor = 4.0
-                    elif key == "player_rebounds":
-                        mu = float(pr.get("REB", np.nan))
-                        stat_label = "REB"
-                        min_sigma_floor = 2.0
-                    elif key == "player_assists":
-                        mu = float(pr.get("AST", np.nan))
-                        stat_label = "AST"
-                        min_sigma_floor = 2.0
-                    else:
-                        mu = float(pr.get("FG3M", np.nan))
-                        stat_label = "3PM"
-                        min_sigma_floor = 1.0
-
-                    # Volatility (minutes-adjusted)
-                    sigma = np.nan
-                    try:
-                        nba_df = league_player_df()
-                        hit = match_player_to_nba(player, nba_df)
-                        if hit is not None:
-                            pid = int(hit["PLAYER_ID"])
-                            sample_mean_min, sd_pts, sd_reb, sd_ast, sd_fg3m = gamelog_volatility(pid, int(vol_games))
-                            proj_min = float(pr.get("Minutes", sample_mean_min))
-                            scale = np.sqrt(max(0.25, proj_min / max(1e-6, sample_mean_min)))
-                            base_sd = {
-                                "PTS": sd_pts,
-                                "REB": sd_reb,
-                                "AST": sd_ast,
-                                "3PM": sd_fg3m,
-                            }[stat_label]
-                            sigma = max(float(base_sd) * float(scale), float(min_sigma_floor))
-                    except Exception:
-                        sigma = np.nan
-
-                    p_over = prob_over_normal(mu, sigma, float(line)) if not pd.isna(mu) else np.nan
-
-                    rows.append({
-                        "Player": pr.get("Name", player),
-                        "Team": pr.get("Team", ""),
-                        "Opp": pr.get("Opp", ""),
-                        "Market": key,
-                        "Stat": stat_label,
-                        "Line": float(line),
-                        "Book_Odds": price,
-                        "ImpliedProb": round(float(american_to_implied_prob(price)), 4) if price is not None else np.nan,
-                        "Proj": round(float(mu), 2) if not pd.isna(mu) else np.nan,
-                        "Sigma": round(float(sigma), 2) if not pd.isna(sigma) else np.nan,
-                        "P_over_model": round(float(p_over), 4) if p_over is not None and not pd.isna(p_over) else np.nan,
-                    })
-
-    prog.empty()
-    props_df = pd.DataFrame(rows)
-    if not props_df.empty:
-        props_df = props_df.sort_values(["P_over_model"], ascending=False)
-    return props_df
-
-if ODDS_API_KEY is None:
-    st.info("Add `ODDS_API_KEY` to Streamlit Secrets to enable DraftKings props + P(over).")
-else:
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        top_players_for_props = st.number_input("How many top projected players to evaluate?", min_value=5, max_value=60, value=10, step=5)
-    with c2:
-        vol_games = st.number_input("Volatility games (for SD)", min_value=3, max_value=20, value=10, step=1)
-    with c3:
-        show_only_over_55 = st.checkbox("Show only P(over) ≥ 55%", value=False)
-
-    if st.button("Pull DK Props + Compute P(Over)"):
-        final_text = gist_read(GIST_FINAL)
-        if not final_text:
-            st.error("No FINAL projections found. Run Step A then Step B first.")
-        else:
-            final_df = pd.read_csv(StringIO(final_text))
-            # If your FINAL doesn't include the stat columns (should), guard:
-            for c in ["PTS", "REB", "AST", "FG3M", "Minutes", "DK_FP", "Team", "Opp", "Name"]:
-                if c not in final_df.columns:
-                    st.error(f"FINAL is missing `{c}`. Re-run Step B.")
-                    st.stop()
-
-            props_df = build_props_table(final_df, ODDS_API_KEY, int(top_players_for_props), int(vol_games))
-            if props_df.empty:
-                st.warning("No props matched your top projections (or The Odds API returned none for DraftKings right now).")
-            else:
-                if show_only_over_55:
-                    props_df = props_df[props_df["P_over_model"] >= 0.55].copy()
-
-                st.dataframe(
-                    props_df[["Player", "Team", "Opp", "Stat", "Line", "Book_Odds", "Proj", "Sigma", "P_over_model", "ImpliedProb"]],
-                    use_container_width=True,
-                    hide_index=True
-                )
-                st.caption("P_over_model is from a normal model centered at our projection with minutes-adjusted volatility from recent game logs. It is *not* a guarantee.")
 
 
 # ==========================
@@ -913,7 +698,6 @@ if "Name_clean" not in pool.columns:
 
 started_teams = set(locked_teams)
 
-
 def assign_locked_to_slots(locked_df):
     players = list(locked_df.index)
     cand = {i: [s for s in DK_SLOTS if eligible_for_slot(locked_df.loc[i, "Positions"], s)] for i in players}
@@ -931,7 +715,7 @@ def assign_locked_to_slots(locked_df):
                 continue
             used_slots.add(s)
             assignment[s] = i
-            if backtrack(k + 1):
+            if backtrack(k+1):
                 return True
             used_slots.remove(s)
             assignment.pop(s, None)
@@ -940,12 +724,19 @@ def assign_locked_to_slots(locked_df):
     ok = backtrack(0)
     return assignment if ok else None
 
-
 if st.button("Optimize (respect locks)"):
     locked_df = pool[pool["Name_clean"].isin(locked_players_set)].copy()
 
-    # Exclude started teams from NEW selections (but keep locked players even if started)
+    # 1) Start with pool
     candidate_df = pool.copy()
+
+    # 2) Remove EXCLUDES from optimizer pool (this is the key fix)
+    if exclude_teams:
+        candidate_df = candidate_df[~candidate_df["Team"].isin(set(exclude_teams))].copy()
+    if exclude_players_set:
+        candidate_df = candidate_df[~candidate_df["Name_clean"].isin(exclude_players_set)].copy()
+
+    # 3) Late swap: exclude started teams from NEW selections (but keep locked players even if started)
     if started_teams:
         candidate_df = candidate_df[~candidate_df["Team"].isin(started_teams)].copy()
         candidate_df = pd.concat([candidate_df, locked_df], axis=0).drop_duplicates(subset=["Name_clean"])
@@ -993,7 +784,7 @@ if st.button("Optimize (respect locks)"):
                 x[(i, slot)] = LpVariable(f"x_{i}_{slot}", 0, 1, LpBinary)
 
     if not x:
-        st.error("No feasible candidates for remaining slots (too many teams locked / too many players out).")
+        st.error("No feasible candidates for remaining slots (too many teams locked / excludes too strict / too many players out).")
         st.stop()
 
     prob += lpSum(opt_pool.loc[i, "DK_FP"] * x[(i, slot)] for (i, slot) in x)
@@ -1033,6 +824,11 @@ if st.button("Optimize (respect locks)"):
     st.dataframe(lineup_df[["Slot", "Locked", "Name", "Team", "Salary", "Minutes", "DK_FP"]], use_container_width=True)
     st.metric("Total Salary", int(lineup_df["Salary"].sum()))
     st.metric("Total DK FP", round(float(lineup_df["DK_FP"].sum()), 2))
+
+    if exclude_teams:
+        st.caption(f"Excluded teams from optimizer pool: {', '.join(exclude_teams)}")
+    if exclude_players:
+        st.caption(f"Excluded players from optimizer pool: {', '.join(exclude_players[:12])}{'...' if len(exclude_players)>12 else ''}")
 
     if started_teams:
         st.caption(f"Started/locked teams excluded from NEW selections: {', '.join(sorted(list(started_teams)))}")
