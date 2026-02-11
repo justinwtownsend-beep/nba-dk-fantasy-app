@@ -33,7 +33,7 @@ LEAGUE_TIMEOUT = 20
 GAMELOG_TIMEOUT = 12
 GAMELOG_RETRIES = 2
 
-MAX_MINUTES = 34          # <-- hard cap (your request)
+MAX_MINUTES = 34
 BENCH_FLOOR = 6
 
 # Recency blend weights
@@ -77,6 +77,7 @@ st.title("DK NBA Optimizer — Fast + DvP (Manual CSV) + Late Swap Locks")
 # ==========================
 SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
 
+
 def deaccent(s: str) -> str:
     return (
         unicodedata.normalize("NFKD", str(s))
@@ -84,10 +85,12 @@ def deaccent(s: str) -> str:
         .decode("ascii")
     )
 
+
 def clean_name(s: str) -> str:
     s = deaccent(s).lower()
     s = s.replace(".", "").replace(",", "").replace("’", "'").replace("`", "'")
     return " ".join(s.split())
+
 
 def strip_suffix(name: str) -> str:
     parts = clean_name(name).split()
@@ -95,13 +98,16 @@ def strip_suffix(name: str) -> str:
         parts = parts[:-1]
     return " ".join(parts)
 
+
 def parse_positions(p):
     return [x.strip().upper() for x in str(p).split("/") if x.strip()]
+
 
 def primary_pos(pos_list):
     if not pos_list:
         return None
     return str(pos_list[0]).upper()
+
 
 def eligible_for_slot(pos_list, slot):
     pos = set(pos_list or [])
@@ -114,6 +120,7 @@ def eligible_for_slot(pos_list, slot):
     if slot == "UTIL":
         return True
     return False
+
 
 def dk_fp(r):
     fp = (
@@ -132,6 +139,7 @@ def dk_fp(r):
         fp += 3.0
     return round(fp, 2)
 
+
 def parse_minutes_min(x):
     s = str(x)
     if ":" not in s:
@@ -139,8 +147,10 @@ def parse_minutes_min(x):
     m, sec = s.split(":")
     return float(m) + float(sec) / 60
 
+
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
+
 
 def norm_team(t: str) -> str:
     if t is None:
@@ -150,6 +160,7 @@ def norm_team(t: str) -> str:
         return ""
     t = t.split()[0]  # handles "NY  1" style cells
     return TEAM_ALIASES.get(t, t)
+
 
 # DK "Game Info": "LAL@BOS 07:30PM ET"
 def parse_opponent_from_gameinfo(team_abbrev: str, game_info: str):
@@ -171,6 +182,7 @@ def parse_opponent_from_gameinfo(team_abbrev: str, game_info: str):
         return away
     return None
 
+
 def _to_float_first_token(val):
     """
     Your DvP cells look like: "21.0   21" or "3.5  10"
@@ -184,6 +196,7 @@ def _to_float_first_token(val):
     if not m:
         return np.nan
     return float(m.group(0))
+
 
 def _team_first_token(val):
     """
@@ -203,13 +216,16 @@ def _team_first_token(val):
 GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
 GIST_ID = st.secrets["GIST_ID"]
 
+
 def gh():
     return {"Authorization": f"token {GITHUB_TOKEN}"}
+
 
 def gist():
     r = requests.get(f"https://api.github.com/gists/{GIST_ID}", headers=gh(), timeout=25)
     r.raise_for_status()
     return r.json()
+
 
 def gist_read(name):
     g = gist()
@@ -221,6 +237,7 @@ def gist_read(name):
     r = requests.get(f["raw_url"], timeout=25)
     r.raise_for_status()
     return r.text
+
 
 def gist_write(files):
     payload = {"files": {k: {"content": v} for k, v in files.items()}}
@@ -247,6 +264,7 @@ def league_player_df():
     df["NBA_Name_stripped"] = df["NBA_Name"].apply(strip_suffix)
     df["NBA_Last"] = df["NBA_Name_clean"].apply(lambda x: x.split()[-1] if isinstance(x, str) and x.split() else "")
     return df
+
 
 def match_player_to_nba(slate_name, nba_df):
     cn = clean_name(slate_name)
@@ -278,6 +296,7 @@ def match_player_to_nba(slate_name, nba_df):
     if hit:
         return nba_df[nba_df["NBA_Name_clean"] == hit[0]].iloc[0]
     return None
+
 
 def gamelog_recent(pid: int, last_n: int):
     last_err = None
@@ -394,12 +413,12 @@ slate["LOCK"] = slate.apply(lambda r: True if r["Name_clean"] in saved_locked_pl
 slate["OUT"] = slate["Name_clean"].map(lambda x: bool(saved_out.get(x, False)))
 
 edited = st.data_editor(
-    slate[["OUT","LOCK","Name","Team","Opp","PrimaryPos","Salary","Positions"]],
+    slate[["OUT", "LOCK", "Name", "Team", "Opp", "PrimaryPos", "Salary", "Positions"]],
     column_config={
         "OUT": st.column_config.CheckboxColumn("OUT"),
         "LOCK": st.column_config.CheckboxColumn("LOCK"),
     },
-    disabled=["Name","Team","Opp","PrimaryPos","Salary","Positions"],
+    disabled=["Name", "Team", "Opp", "PrimaryPos", "Salary", "Positions"],
     use_container_width=True,
     hide_index=True,
 )
@@ -445,7 +464,7 @@ def load_dvp_book1(text: str):
 
     dvp = pd.read_csv(StringIO(text))
 
-    required = ["Sort: Position","Sort: Team","Sort: PTS","Sort: 3PM","Sort: REB","Sort: AST","Sort: STL","Sort: BLK","Sort: TO"]
+    required = ["Sort: Position", "Sort: Team", "Sort: PTS", "Sort: 3PM", "Sort: REB", "Sort: AST", "Sort: STL", "Sort: BLK", "Sort: TO"]
     missing = [c for c in required if c not in dvp.columns]
     if missing:
         return None, f"DvP CSV missing columns: {missing}"
@@ -462,11 +481,12 @@ def load_dvp_book1(text: str):
     out["BLK"] = dvp["Sort: BLK"].apply(_to_float_first_token)
     out["TOV"] = dvp["Sort: TO"].apply(_to_float_first_token)
 
-    out = out.dropna(subset=["TEAM","POS","PTS","FG3M","REB","AST","STL","BLK","TOV"]).copy()
+    out = out.dropna(subset=["TEAM", "POS", "PTS", "FG3M", "REB", "AST", "STL", "BLK", "TOV"]).copy()
     out = out[(out["TEAM"] != "") & (out["POS"] != "")].copy()
 
-    league_avg = out.groupby("POS")[["PTS","REB","AST","FG3M","STL","BLK","TOV"]].mean().reset_index()
+    league_avg = out.groupby("POS")[["PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV"]].mean().reset_index()
     return (out, league_avg), None
+
 
 dvp_pack = None
 if dvp_text:
@@ -524,16 +544,17 @@ if st.button("Build BASE"):
             except Exception as e:
                 notes = f"RECENCY_FAIL: {str(e)[:80]}"
 
+        # enforce max minutes at BASE as well (keeps things stable)
         mins = min(float(mins), MAX_MINUTES)
 
-        row = {**r.to_dict(), "Minutes": round(mins, 2), **stats, "Status": "OK", "Notes": notes}
+        row = {**r.to_dict(), "Minutes": round(float(mins), 2), **stats, "Status": "OK", "Notes": notes}
         rows.append(row)
 
     base = pd.DataFrame(rows)
     base["DK_FP"] = base.apply(lambda rr: dk_fp(rr) if rr["Status"] == "OK" else np.nan, axis=1)
     gist_write({GIST_BASE: base.to_csv(index=False)})
     st.success("Saved BASE")
-    st.dataframe(base[["Name","Team","Opp","PrimaryPos","Salary","Minutes","DK_FP","Status","Notes"]], use_container_width=True)
+    st.dataframe(base[["Name", "Team", "Opp", "PrimaryPos", "Salary", "Minutes", "DK_FP", "Status", "Notes"]], use_container_width=True)
 
 
 # ==========================
@@ -558,7 +579,6 @@ if st.button("Run Projections"):
     base["Notes"] = base.get("Notes", "").fillna("").astype(str)
 
     base["BumpNotes"] = ""
-    base["UsageNotes"] = ""
     base["DvPNotes"] = ""
     base["DvPMult"] = 1.0
 
@@ -574,14 +594,7 @@ if st.button("Run Projections"):
         )
         base[f"PM_{c}"] = base[f"PM_{c}"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    # redistribute minutes by team (blend: minutes + role)
-    # Also apply a small, conservative "usage" bump to likely creators when high-minute players are OUT.
-    POS_GROUP = {
-        "PG": "G", "SG": "G",
-        "SF": "W", "PF": "W",
-        "C": "B",
-    }
-
+    # redistribute minutes by team (capped at MAX_MINUTES)
     for team in base["Team"].dropna().unique():
         out_t = base[(base["Team"] == team) & (base["Status"] == "OUT")]
         ok_t = base[(base["Team"] == team) & (base["Status"] == "OK")]
@@ -592,74 +605,15 @@ if st.button("Run Projections"):
         if missing <= 0:
             continue
 
-        # --- role-aware minute weights (blend) ---
-        out_pos = out_t.get("PrimaryPos", pd.Series([], dtype=str)).fillna("").astype(str).str.upper().tolist()
-        out_groups = set(POS_GROUP.get(p, "") for p in out_pos if p)
-
-        weights = []
-        for idx, r in ok_t.iterrows():
-            base_m = float(r.get("Minutes", 0) or 0)
-            w = max(base_m, BENCH_FLOOR)  # minutes anchor
-
-            p = str(r.get("PrimaryPos", "")).upper().strip()
-            g = POS_GROUP.get(p, "")
-
-            # direct position/group bonus
-            if p and p in out_pos:
-                w *= 1.60
-            elif g and g in out_groups:
-                w *= 1.25
-
-            # mild starter bias (keeps bumps realistic)
-            if base_m >= 28:
-                w *= 1.10
-            elif base_m <= 14:
-                w *= 0.90
-
-            weights.append((idx, w))
-
-        wsum = float(sum(w for _, w in weights))
+        weights = ok_t["Minutes"].fillna(0).clip(lower=BENCH_FLOOR)
+        wsum = float(weights.sum())
         if wsum <= 0:
             continue
 
-        for idx, w in weights:
-            inc = missing * float(w) / wsum
-            new_m = min(float(base.loc[idx, "Minutes"]) + inc, MAX_MINUTES)
-            inc_applied = max(0.0, new_m - float(base.loc[idx, "Minutes"]))
-            base.loc[idx, "Minutes"] = new_m
-            if inc_applied > 0:
-                base.loc[idx, "BumpNotes"] = (base.loc[idx, "BumpNotes"] + f" MIN+{inc_applied:.1f}").strip()
-
-        # --- conservative usage bump to creators (small, capped) ---
-        # We approximate "usage" via creation: PTS + 1.5*AST (+ a little 3PM).
-        # Only apply if OUT minutes are meaningful.
-        if missing >= 12:
-            # how much creation left the floor?
-            out_creation = (out_t["PM_PTS"] + 1.5 * out_t["PM_AST"] + 0.5 * out_t["PM_FG3M"]) * out_t["Minutes"].fillna(0)
-            out_creation = float(out_creation.sum())
-
-            ok_creation = (ok_t["PM_PTS"] + 1.5 * ok_t["PM_AST"] + 0.5 * ok_t["PM_FG3M"]) * ok_t["Minutes"].fillna(0)
-            ok_creation_total = float(ok_creation.sum())
-
-            if out_creation > 0 and ok_creation_total > 0:
-                # overall bump size (tight caps; "conservative mode")
-                # roughly: if a lot of creation is out, allow up to ~8% rate bump for top creators
-                base_bump = clamp(out_creation / ok_creation_total, 0.00, 0.08)
-
-                # pick top 3 creators by rate
-                creator_score = (ok_t["PM_PTS"] + 1.5 * ok_t["PM_AST"] + 0.5 * ok_t["PM_FG3M"]).copy()
-                top_idx = creator_score.sort_values(ascending=False).head(3).index.tolist()
-
-                denom = float(creator_score.loc[top_idx].sum()) if len(top_idx) else 0.0
-                if denom > 0:
-                    for idx in top_idx:
-                        share = float(creator_score.loc[idx]) / denom
-                        bump = base_bump * (0.6 + 0.8 * share)  # skew slightly to the top option
-                        # apply to per-minute rates (keeps everything consistent)
-                        base.loc[idx, "PM_PTS"] *= (1.0 + bump)
-                        base.loc[idx, "PM_AST"] *= (1.0 + clamp(bump * 1.25, 0.0, 0.10))
-                        base.loc[idx, "PM_FG3M"] *= (1.0 + clamp(bump * 1.10, 0.0, 0.08))
-                        base.loc[idx, "UsageNotes"] = (base.loc[idx, "UsageNotes"] + f" USG+{bump*100:.1f}%").strip()
+        for idx in ok_t.index:
+            inc = missing * float(weights.loc[idx]) / wsum
+            base.loc[idx, "Minutes"] = min(float(base.loc[idx, "Minutes"]) + inc, MAX_MINUTES)
+            base.loc[idx, "BumpNotes"] = (base.loc[idx, "BumpNotes"] + f" MIN+{inc:.1f}").strip()
 
     # recompute stats after OUT bump
     for idx in base.index[base["Status"] == "OK"]:
@@ -690,13 +644,13 @@ if st.button("Run Projections"):
             avg = avg_key[pos]
 
             mults = {}
-            for c in ["PTS","REB","AST","FG3M","STL","BLK","TOV"]:
+            for c in ["PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV"]:
                 av = float(avg[c])
                 al = float(allowed[c])
                 mlt = (al / av) if av > 0 else 1.0
                 mults[c] = clamp(mlt, DVP_CAP_LOW, DVP_CAP_HIGH)
 
-            for c in ["PTS","REB","AST","FG3M","STL","BLK","TOV"]:
+            for c in ["PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV"]:
                 base.loc[idx, c] = round(float(base.loc[idx, c]) * mults[c], 2)
 
             base.loc[idx, "DvPMult"] = round(float(np.mean(list(mults.values()))), 4)
@@ -711,8 +665,229 @@ if st.button("Run Projections"):
     gist_write({GIST_FINAL: final.to_csv(index=False)})
 
     st.success("Saved FINAL")
-    show_cols = ["Name","Team","Opp","PrimaryPos","Salary","Minutes","PTS","REB","AST","FG3M","STL","BLK","TOV","DK_FP","Notes","BumpNotes","UsageNotes","DvPNotes"]
+    show_cols = ["Name", "Team", "Opp", "PrimaryPos", "Salary", "Minutes", "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV", "DK_FP", "Notes", "BumpNotes", "DvPNotes"]
     st.dataframe(final[show_cols], use_container_width=True)
+
+
+# ==========================
+# PROPS (DraftKings via The Odds API) — P(Over) using our projections
+# ==========================
+st.divider()
+st.subheader("Props (DraftKings) — P(Over) from our projections")
+
+# NOTE: This pulls DraftKings player props via The Odds API "event-odds" endpoint.
+# Markets used: player_points, player_rebounds, player_assists, player_threes
+
+ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", None)
+
+def american_to_implied_prob(odds: float) -> float:
+    try:
+        o = float(odds)
+    except Exception:
+        return np.nan
+    if o == 0:
+        return np.nan
+    if o < 0:
+        return (-o) / ((-o) + 100.0)
+    return 100.0 / (o + 100.0)
+
+def normal_cdf(z: float) -> float:
+    # standard normal CDF via erf
+    return 0.5 * (1.0 + float(np.math.erf(z / np.sqrt(2.0))))
+
+def prob_over_normal(mu: float, sigma: float, line: float) -> float:
+    if sigma is None or pd.isna(sigma) or float(sigma) <= 1e-9:
+        return np.nan
+    z = (float(mu) - float(line)) / float(sigma)
+    return 1.0 - normal_cdf(z)
+
+@st.cache_data(ttl=300)
+def odds_events_nba(api_key: str):
+    url = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
+    params = {"apiKey": api_key}
+    r = requests.get(url, params=params, timeout=25)
+    r.raise_for_status()
+    return r.json()
+
+@st.cache_data(ttl=300)
+def odds_event_props(api_key: str, event_id: str, markets: str):
+    url = f"https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
+    params = {
+        "regions": "us",
+        "markets": markets,
+        "bookmakers": "draftkings",
+        "oddsFormat": "american",
+        "apiKey": api_key,
+    }
+    r = requests.get(url, params=params, timeout=25)
+    r.raise_for_status()
+    return r.json()
+
+@st.cache_data(ttl=900)
+def gamelog_volatility(pid: int, last_n: int):
+    """
+    Returns:
+      sample_mean_min, sd_pts, sd_reb, sd_ast, sd_fg3m
+    """
+    gl = playergamelog.PlayerGameLog(player_id=int(pid), season=SEASON, timeout=GAMELOG_TIMEOUT).get_data_frames()[0]
+    gl = gl.head(int(last_n)).copy()
+    if gl.empty:
+        raise RuntimeError("EMPTY_GAMELOG")
+    gl["MIN_f"] = gl["MIN"].apply(parse_minutes_min)
+    sample_mean_min = float(gl["MIN_f"].mean()) if float(gl["MIN_f"].mean()) > 0 else 1.0
+    # Per-game SDs
+    sd_pts = float(np.nanstd(gl["PTS"].astype(float), ddof=1)) if len(gl) > 1 else 0.0
+    sd_reb = float(np.nanstd(gl["REB"].astype(float), ddof=1)) if len(gl) > 1 else 0.0
+    sd_ast = float(np.nanstd(gl["AST"].astype(float), ddof=1)) if len(gl) > 1 else 0.0
+    sd_fg3m = float(np.nanstd(gl["FG3M"].astype(float), ddof=1)) if len(gl) > 1 else 0.0
+    return sample_mean_min, sd_pts, sd_reb, sd_ast, sd_fg3m
+
+def build_props_table(final_df: pd.DataFrame, api_key: str, top_players: int, vol_games: int):
+    if final_df is None or final_df.empty:
+        return pd.DataFrame()
+
+    # We'll only evaluate props for the top N DK_FP players (fast + useful).
+    top_df = final_df.sort_values("DK_FP", ascending=False).head(int(top_players)).copy()
+
+    # Map player name -> proj stats
+    top_df["Name_clean"] = top_df["Name"].apply(clean_name)
+    proj_map = {r["Name_clean"]: r for _, r in top_df.iterrows()}
+
+    events = odds_events_nba(api_key)
+    # Pull props for each event (DraftKings only). Cost depends on markets count. Keep it tight.
+    markets = "player_points,player_rebounds,player_assists,player_threes"
+
+    rows = []
+    prog = st.progress(0, text="Pulling DraftKings props via The Odds API...")
+    for i, ev in enumerate(events):
+        prog.progress((i + 1) / max(1, len(events)), text=f"Props: {ev.get('away_team','?')} @ {ev.get('home_team','?')} ({i+1}/{len(events)})")
+        try:
+            ev_odds = odds_event_props(api_key, ev["id"], markets=markets)
+        except Exception:
+            # Skip event on error
+            continue
+
+        for bk in ev_odds.get("bookmakers", []):
+            if bk.get("key") != "draftkings":
+                continue
+            for mkt in bk.get("markets", []):
+                key = mkt.get("key")
+                if key not in ["player_points", "player_rebounds", "player_assists", "player_threes"]:
+                    continue
+
+                for oc in mkt.get("outcomes", []):
+                    # Each outcome is Over/Under with description = player name
+                    side = oc.get("name")
+                    if side != "Over":
+                        continue  # user only wants P(over)
+                    player = oc.get("description", "")
+                    line = oc.get("point", None)
+                    price = oc.get("price", None)
+                    if player is None or line is None:
+                        continue
+
+                    pclean = clean_name(player)
+                    # Only include players we have projections for (top players)
+                    if pclean not in proj_map:
+                        continue
+
+                    pr = proj_map[pclean]
+                    # Choose projected stat
+                    if key == "player_points":
+                        mu = float(pr.get("PTS", np.nan))
+                        stat_label = "PTS"
+                        min_sigma_floor = 4.0
+                    elif key == "player_rebounds":
+                        mu = float(pr.get("REB", np.nan))
+                        stat_label = "REB"
+                        min_sigma_floor = 2.0
+                    elif key == "player_assists":
+                        mu = float(pr.get("AST", np.nan))
+                        stat_label = "AST"
+                        min_sigma_floor = 2.0
+                    else:
+                        mu = float(pr.get("FG3M", np.nan))
+                        stat_label = "3PM"
+                        min_sigma_floor = 1.0
+
+                    # Volatility (minutes-adjusted)
+                    sigma = np.nan
+                    try:
+                        nba_df = league_player_df()
+                        hit = match_player_to_nba(player, nba_df)
+                        if hit is not None:
+                            pid = int(hit["PLAYER_ID"])
+                            sample_mean_min, sd_pts, sd_reb, sd_ast, sd_fg3m = gamelog_volatility(pid, int(vol_games))
+                            proj_min = float(pr.get("Minutes", sample_mean_min))
+                            scale = np.sqrt(max(0.25, proj_min / max(1e-6, sample_mean_min)))
+                            base_sd = {
+                                "PTS": sd_pts,
+                                "REB": sd_reb,
+                                "AST": sd_ast,
+                                "3PM": sd_fg3m,
+                            }[stat_label]
+                            sigma = max(float(base_sd) * float(scale), float(min_sigma_floor))
+                    except Exception:
+                        sigma = np.nan
+
+                    p_over = prob_over_normal(mu, sigma, float(line)) if not pd.isna(mu) else np.nan
+
+                    rows.append({
+                        "Player": pr.get("Name", player),
+                        "Team": pr.get("Team", ""),
+                        "Opp": pr.get("Opp", ""),
+                        "Market": key,
+                        "Stat": stat_label,
+                        "Line": float(line),
+                        "Book_Odds": price,
+                        "ImpliedProb": round(float(american_to_implied_prob(price)), 4) if price is not None else np.nan,
+                        "Proj": round(float(mu), 2) if not pd.isna(mu) else np.nan,
+                        "Sigma": round(float(sigma), 2) if not pd.isna(sigma) else np.nan,
+                        "P_over_model": round(float(p_over), 4) if p_over is not None and not pd.isna(p_over) else np.nan,
+                    })
+
+    prog.empty()
+    props_df = pd.DataFrame(rows)
+    if not props_df.empty:
+        props_df = props_df.sort_values(["P_over_model"], ascending=False)
+    return props_df
+
+if ODDS_API_KEY is None:
+    st.info("Add `ODDS_API_KEY` to Streamlit Secrets to enable DraftKings props + P(over).")
+else:
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        top_players_for_props = st.number_input("How many top projected players to evaluate?", min_value=5, max_value=60, value=10, step=5)
+    with c2:
+        vol_games = st.number_input("Volatility games (for SD)", min_value=3, max_value=20, value=10, step=1)
+    with c3:
+        show_only_over_55 = st.checkbox("Show only P(over) ≥ 55%", value=False)
+
+    if st.button("Pull DK Props + Compute P(Over)"):
+        final_text = gist_read(GIST_FINAL)
+        if not final_text:
+            st.error("No FINAL projections found. Run Step A then Step B first.")
+        else:
+            final_df = pd.read_csv(StringIO(final_text))
+            # If your FINAL doesn't include the stat columns (should), guard:
+            for c in ["PTS", "REB", "AST", "FG3M", "Minutes", "DK_FP", "Team", "Opp", "Name"]:
+                if c not in final_df.columns:
+                    st.error(f"FINAL is missing `{c}`. Re-run Step B.")
+                    st.stop()
+
+            props_df = build_props_table(final_df, ODDS_API_KEY, int(top_players_for_props), int(vol_games))
+            if props_df.empty:
+                st.warning("No props matched your top projections (or The Odds API returned none for DraftKings right now).")
+            else:
+                if show_only_over_55:
+                    props_df = props_df[props_df["P_over_model"] >= 0.55].copy()
+
+                st.dataframe(
+                    props_df[["Player", "Team", "Opp", "Stat", "Line", "Book_Odds", "Proj", "Sigma", "P_over_model", "ImpliedProb"]],
+                    use_container_width=True,
+                    hide_index=True
+                )
+                st.caption("P_over_model is from a normal model centered at our projection with minutes-adjusted volatility from recent game logs. It is *not* a guarantee.")
 
 
 # ==========================
@@ -730,7 +905,7 @@ pool = pd.read_csv(StringIO(final_text))
 pool["Positions"] = pool["Positions"].apply(eval)
 pool["Salary"] = pd.to_numeric(pool["Salary"], errors="coerce")
 pool["DK_FP"] = pd.to_numeric(pool["DK_FP"], errors="coerce")
-pool = pool.dropna(subset=["Salary","DK_FP"]).copy()
+pool = pool.dropna(subset=["Salary", "DK_FP"]).copy()
 pool = pool[pool["Salary"] > 0].copy()
 
 if "Name_clean" not in pool.columns:
@@ -738,9 +913,10 @@ if "Name_clean" not in pool.columns:
 
 started_teams = set(locked_teams)
 
+
 def assign_locked_to_slots(locked_df):
     players = list(locked_df.index)
-    cand = {i: [s for s in DK_SLOTS if eligible_for_slot(locked_df.loc[i,"Positions"], s)] for i in players}
+    cand = {i: [s for s in DK_SLOTS if eligible_for_slot(locked_df.loc[i, "Positions"], s)] for i in players}
     players_sorted = sorted(players, key=lambda i: len(cand[i]))
 
     used_slots = set()
@@ -755,7 +931,7 @@ def assign_locked_to_slots(locked_df):
                 continue
             used_slots.add(s)
             assignment[s] = i
-            if backtrack(k+1):
+            if backtrack(k + 1):
                 return True
             used_slots.remove(s)
             assignment.pop(s, None)
@@ -763,6 +939,7 @@ def assign_locked_to_slots(locked_df):
 
     ok = backtrack(0)
     return assignment if ok else None
+
 
 if st.button("Optimize (respect locks)"):
     locked_df = pool[pool["Name_clean"].isin(locked_players_set)].copy()
@@ -799,7 +976,7 @@ if st.button("Optimize (respect locks)"):
             row["Locked"] = True
             lineup.append(row)
         lineup_df = pd.DataFrame(lineup).sort_values("Slot")
-        st.dataframe(lineup_df[["Slot","Locked","Name","Team","Salary","DK_FP","Minutes"]], use_container_width=True)
+        st.dataframe(lineup_df[["Slot", "Locked", "Name", "Team", "Salary", "DK_FP", "Minutes"]], use_container_width=True)
         st.metric("Total Salary", int(salary_locked))
         st.metric("Total DK FP", round(float(lineup_df["DK_FP"].sum()), 2))
         st.stop()
@@ -853,7 +1030,7 @@ if st.button("Optimize (respect locks)"):
         lineup.append(row)
 
     lineup_df = pd.DataFrame(lineup).sort_values("Slot")
-    st.dataframe(lineup_df[["Slot","Locked","Name","Team","Salary","Minutes","DK_FP"]], use_container_width=True)
+    st.dataframe(lineup_df[["Slot", "Locked", "Name", "Team", "Salary", "Minutes", "DK_FP"]], use_container_width=True)
     st.metric("Total Salary", int(lineup_df["Salary"].sum()))
     st.metric("Total DK FP", round(float(lineup_df["DK_FP"].sum()), 2))
 
