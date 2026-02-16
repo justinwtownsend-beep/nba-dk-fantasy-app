@@ -2,6 +2,7 @@
 # DraftKings NBA Optimizer
 # Fast + Recency + Manual Hashtag DvP (Book1.csv "Sort:" columns) + Late Swap Locks
 # + EXCLUDE players/teams from optimizer pool (does NOT lock them)
+# + LEARNING (DFS + Props): season-to-date stable calibration from your slate history
 # WITH TEAM ABBREVIATION NORMALIZATION (fixes NY/SA/etc.)
 # ==========================
 
@@ -11,6 +12,7 @@ import unicodedata
 import time
 import re
 from io import StringIO
+from datetime import datetime, timezone, date
 
 import numpy as np
 import pandas as pd
@@ -52,6 +54,10 @@ GIST_OUT = "out.json"
 GIST_LOCKS = "locks.json"
 GIST_BASE = "base.csv"
 GIST_FINAL = "final.csv"
+
+# Learning storage (Gist)
+GIST_HISTORY = "history.csv"               # stores Step B outputs (your slates)
+GIST_PLAYER_CAL = "player_calibration.csv" # learned player bias + sigma
 
 # Team abbreviation normalization (Hashtag vs DK vs NBA)
 TEAM_ALIASES = {
@@ -234,6 +240,20 @@ def gist_write(files):
     payload = {"files": {k: {"content": v} for k, v in files.items()}}
     r = requests.patch(f"https://api.github.com/gists/{GIST_ID}", headers=gh(), json=payload, timeout=25)
     r.raise_for_status()
+
+
+def read_csv_from_gist(name):
+    txt = gist_read(name)
+    if not txt:
+        return None
+    try:
+        return pd.read_csv(StringIO(txt))
+    except Exception:
+        return None
+
+
+def write_csv_to_gist(name, df: pd.DataFrame):
+    gist_write({name: df.to_csv(index=False)})
 
 
 # ==========================
@@ -503,6 +523,121 @@ if dvp_text:
 
 
 # ==========================
+# LEARNING HELPERS
+# ==========================
+def ensure_player_calibration():
+    cal = read_csv_from_gist(GIST_PLAYER_CAL)
+    if cal is None or cal.empty:
+        cal = pd.DataFrame(columns=[
+            "Name_clean",
+            "bias_PTS", "bias_REB", "bias_AST", "bias_FG3M",
+            "sigma_PTS", "sigma_REB", "sigma_AST", "sigma_FG3M",
+            "n"
+        ])
+        write_csv_to_gist(GIST_PLAYER_CAL, cal)
+    return cal
+
+
+def update_player_calibration(train_df: pd.DataFrame, lr: float = 0.05):
+    """
+    train_df must contain:
+      Name_clean, PROJ_PTS/REB/AST/FG3M, ACT_PTS/REB/AST/FG3M
+    """
+    cal = ensure_player_calibration()
+    cal = cal.set_index("Name_clean", drop=False)
+
+    for _, r in train_df.iterrows():
+        key = r["Name_clean"]
+        if key not in cal.index:
+            cal.loc[key, :] = {
+                "Name_clean": key,
+                "bias_PTS": 1.0, "bias_REB": 1.0, "bias_AST": 1.0, "bias_FG3M": 1.0,
+                "sigma_PTS": 1.0, "sigma_REB": 1.0, "sigma_AST": 1.0, "sigma_FG3M": 1.0,
+                "n": 0
+            }
+
+        # Bias update (multiplicative): actual/proj
+        for stat in ["PTS", "REB", "AST", "FG3M"]:
+            p = float(r.get(f"PROJ_{stat}", np.nan))
+            a = float(r.get(f"ACT_{stat}", np.nan))
+            if not np.isfinite(p) or p <= 0 or not np.isfinite(a):
+                continue
+
+            ratio = a / p
+            ratio = clamp(ratio, 0.60, 1.40)  # stability clamp
+
+            old = float(cal.loc[key, f"bias_{stat}"])
+            new = (1 - lr) * old + lr * ratio
+            cal.loc[key, f"bias_{stat}"] = float(clamp(new, 0.75, 1.25))
+
+            # Sigma scale update: relative absolute error
+            rel_err = abs(a - p) / max(p, 1.0)
+            rel_err = clamp(rel_err, 0.0, 1.50)
+            old_s = float(cal.loc[key, f"sigma_{stat}"])
+            # target sigma scale around 1.0; if rel_err ~ 0.25, sigma maybe 1.25, etc.
+            target = clamp(1.0 + rel_err, 0.80, 1.80)
+            new_s = (1 - lr) * old_s + lr * target
+            cal.loc[key, f"sigma_{stat}"] = float(clamp(new_s, 0.80, 1.80))
+
+        cal.loc[key, "n"] = int(cal.loc[key, "n"]) + 1
+
+    cal = cal.reset_index(drop=True)
+    write_csv_to_gist(GIST_PLAYER_CAL, cal)
+    return cal
+
+
+def fetch_actuals_for_date(nba_df: pd.DataFrame, name_list: list[str], target_date: date):
+    """
+    For each player name, find their NBA PLAYER_ID then pull gamelog and extract the row matching target_date.
+    Returns df with Name_clean, ACT_*.
+    """
+    rows = []
+    # nba_api GAME_DATE comes like "FEB 16, 2026"
+    target = pd.Timestamp(target_date)
+
+    prog = st.progress(0, text="Pulling actuals from NBA gamelogs...")
+    for i, nm in enumerate(name_list):
+        prog.progress((i + 1) / max(len(name_list), 1), text=f"Actuals: {nm} ({i+1}/{len(name_list)})")
+        hit = match_player_to_nba(nm, nba_df)
+        if hit is None:
+            continue
+        pid = int(hit["PLAYER_ID"])
+
+        last_err = None
+        gl = None
+        for attempt in range(1, GAMELOG_RETRIES + 1):
+            try:
+                gl = playergamelog.PlayerGameLog(player_id=pid, season=SEASON, timeout=GAMELOG_TIMEOUT).get_data_frames()[0]
+                break
+            except Exception as e:
+                last_err = str(e)
+                time.sleep(0.4 * attempt)
+
+        if gl is None or gl.empty:
+            continue
+
+        # Normalize GAME_DATE and match exact date
+        try:
+            gl["GAME_DATE_DT"] = pd.to_datetime(gl["GAME_DATE"], errors="coerce")
+            g = gl[gl["GAME_DATE_DT"].dt.date == target.date()]
+            if g.empty:
+                continue
+            g = g.iloc[0]
+            rows.append({
+                "Name_clean": clean_name(nm),
+                "ACT_PTS": float(g["PTS"]),
+                "ACT_REB": float(g["REB"]),
+                "ACT_AST": float(g["AST"]),
+                "ACT_FG3M": float(g["FG3M"]),
+            })
+        except Exception:
+            continue
+
+    prog.empty()
+    return pd.DataFrame(rows)
+
+
+# ==========================
 # STEP A — BUILD BASE
 # ==========================
 st.divider()
@@ -562,10 +697,10 @@ if st.button("Build BASE"):
 
 
 # ==========================
-# STEP B — RUN PROJECTIONS (OUT bumps + DvP)
+# STEP B — RUN PROJECTIONS (OUT bumps + DvP + LEARNED CALIBRATION)
 # ==========================
 st.divider()
-st.subheader("Step B — Run Projections (OUT bumps + DvP)")
+st.subheader("Step B — Run Projections (OUT bumps + DvP + Learning)")
 
 if st.button("Run Projections"):
     base_text = gist_read(GIST_BASE)
@@ -663,16 +798,116 @@ if st.button("Run Projections"):
                 f"PTS{mults['PTS']:.2f} REB{mults['REB']:.2f} AST{mults['AST']:.2f}"
             )
 
+    # ---- APPLY LEARNED PLAYER CALIBRATION (bias multipliers) ----
+    cal = read_csv_from_gist(GIST_PLAYER_CAL)
+    if cal is not None and not cal.empty:
+        cal = cal.dropna(subset=["Name_clean"]).copy()
+        cal = cal.set_index("Name_clean", drop=False)
+        for stat in ["PTS", "REB", "AST", "FG3M"]:
+            bcol = f"bias_{stat}"
+            if bcol in cal.columns:
+                mult = base["Name_clean"].map(lambda x: float(cal.loc[x, bcol]) if x in cal.index else 1.0)
+                mult = pd.to_numeric(mult, errors="coerce").fillna(1.0)
+                mask = base["Status"] == "OK"
+                base.loc[mask, stat] = (pd.to_numeric(base.loc[mask, stat], errors="coerce").fillna(0.0) * mult.loc[mask]).round(2)
+        # note marker
+        base.loc[base["Status"] == "OK", "Notes"] = base.loc[base["Status"] == "OK", "Notes"].astype(str) + " | CAL"
+
     base.loc[base["Status"] == "OK", "DK_FP"] = base[base["Status"] == "OK"].apply(dk_fp, axis=1)
 
     final = base[(base["Status"] == "OK") & (~base["Name_clean"].isin(out_set))].copy()
     gist_write({GIST_FINAL: final.to_csv(index=False)})
 
-    st.success("Saved FINAL")
+    # ---- SAVE HISTORY FOR LEARNING ----
+    run_ts = datetime.now(timezone.utc).isoformat()
+    hist = base.copy()
+    hist["RunTS"] = run_ts
+    hist["IsOut"] = (hist["Status"] == "OUT").astype(int)
+
+    keep_cols = [
+        "RunTS", "Name", "Name_clean", "Team", "Opp", "PrimaryPos", "Salary",
+        "Minutes", "PTS", "REB", "AST", "FG3M", "DK_FP", "Status", "IsOut"
+    ]
+    hist = hist[[c for c in keep_cols if c in hist.columns]].copy()
+
+    existing = read_csv_from_gist(GIST_HISTORY)
+    if existing is None or existing.empty:
+        combined = hist
+    else:
+        combined = pd.concat([existing, hist], ignore_index=True)
+
+    # cap size
+    combined = combined.tail(20000)
+    write_csv_to_gist(GIST_HISTORY, combined)
+
+    st.success("Saved FINAL + History")
     show_cols = ["Name", "Salary", "Team", "Opp", "PrimaryPos", "Minutes",
                  "PTS", "REB", "AST", "FG3M", "STL", "BLK", "TOV", "DK_FP",
                  "Notes", "BumpNotes", "DvPNotes"]
-    st.dataframe(final[show_cols], use_container_width=True)
+    st.dataframe(final[[c for c in show_cols if c in final.columns]], use_container_width=True)
+
+
+# ==========================
+# LEARNING UI (TRAIN)
+# ==========================
+st.divider()
+st.subheader("Learning — Train (DFS + Props, Season-to-date stable)")
+
+st.caption(
+    "This trains player bias + volatility scaling using your saved slate history and NBA actual stats for a selected game date."
+)
+
+train_date = st.date_input("Game date to train on", value=None)
+
+colA, colB = st.columns([1, 2])
+with colA:
+    lr = st.slider("Learning rate (stable)", 0.01, 0.20, 0.05, 0.01)
+with colB:
+    st.write("Tip: use a small learning rate (0.03–0.07). Bigger = more reactive, less stable.")
+
+if st.button("Train / Update Learned Model"):
+    if train_date is None:
+        st.error("Pick a game date first.")
+        st.stop()
+
+    hist = read_csv_from_gist(GIST_HISTORY)
+    if hist is None or hist.empty:
+        st.error("No history found yet. Run Step B at least once to create history.")
+        st.stop()
+
+    # Use history rows from any RunTS (we train based on GAME DATE, not run timestamp)
+    # We'll pull actuals for every unique player in history (recently saved ones matter most).
+    # To keep this fast, train using last ~2500 rows.
+    hist = hist.tail(2500).copy()
+
+    # Build projection table
+    for s in ["PTS", "REB", "AST", "FG3M"]:
+        hist[f"PROJ_{s}"] = pd.to_numeric(hist[s], errors="coerce")
+
+    # Pull actuals for the selected game date
+    nba_df = league_player_df()
+    uniq_names = hist["Name"].dropna().astype(str).unique().tolist()
+
+    act = fetch_actuals_for_date(nba_df, uniq_names, train_date)
+    if act is None or act.empty:
+        st.error("Could not pull actuals for that date (timeouts or no matching games). Try another date.")
+        st.stop()
+
+    train = hist.merge(act, left_on="Name_clean", right_on="Name_clean", how="inner")
+    train = train.dropna(subset=["PROJ_PTS", "ACT_PTS"], how="any")
+
+    if train.empty:
+        st.error("No overlap between your history projections and actuals for that date.")
+        st.stop()
+
+    cal = update_player_calibration(train, lr=float(lr))
+    st.success("Learned model updated ✓")
+
+    # Show top trained players
+    if "n" in cal.columns:
+        st.dataframe(cal.sort_values("n", ascending=False).head(40), use_container_width=True)
+    else:
+        st.dataframe(cal.head(40), use_container_width=True)
 
 
 # ==========================
